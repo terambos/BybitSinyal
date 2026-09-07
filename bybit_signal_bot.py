@@ -108,9 +108,19 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # ----------------------------------------------------------------------
 
 def build_exchange() -> ccxt.binanceusdm:
-    return ccxt.binanceusdm({
+    exchange = ccxt.binanceusdm({
         "enableRateLimit": True,
     })
+    # GitHub Actions ABD'de calistigi ve Binance/Bybit ABD IP'lerini
+    # engelledigi icin, ayarlanmissa istekleri ucretsiz bir Cloudflare
+    # Worker proxy'si uzerinden yonlendiriyoruz.
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if proxy_url:
+        if not proxy_url.endswith("/"):
+            proxy_url += "/"
+        exchange.proxyUrl = proxy_url
+        print(f"Istekler proxy uzerinden gonderiliyor: {proxy_url}")
+    return exchange
 
 
 def get_available_symbols(exchange: ccxt.binanceusdm, bases: list[str]) -> list[str]:
