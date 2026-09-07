@@ -109,16 +109,38 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # VERI CEKME
 # ----------------------------------------------------------------------
 
-def build_exchange() -> ccxt.bybit:
+# Bybit'in ana adresi (bybit.com) bazi bulut saglayicilarinin (GitHub Actions
+# dahil) IP araliklarini CloudFront seviyesinde engelliyor. Bu yuzden birden
+# fazla alternatif hostname deneyip calisanini kullaniyoruz.
+BYBIT_HOSTNAMES = ["bytick.com", "bybit.com", "bybit.nl"]
+
+
+def build_exchange(hostname: str) -> ccxt.bybit:
     return ccxt.bybit({
         "enableRateLimit": True,
+        "hostname": hostname,
         "options": {"defaultType": "swap"},
     })
 
 
+def build_working_exchange() -> ccxt.bybit:
+    """Engellenmemis calisan bir Bybit hostname'i bulup exchange nesnesini dondurur."""
+    last_error = None
+    for hostname in BYBIT_HOSTNAMES:
+        exchange = build_exchange(hostname)
+        try:
+            exchange.load_markets()
+            print(f"Bybit'e '{hostname}' adresi uzerinden baglanildi.")
+            return exchange
+        except Exception as e:
+            print(f"'{hostname}' adresi calismadi, digeri deneniyor... ({e})", file=sys.stderr)
+            last_error = e
+    raise RuntimeError(f"Hicbir Bybit adresine baglanilamadi. Son hata: {last_error}")
+
+
 def get_available_symbols(exchange: ccxt.bybit, bases: list[str]) -> list[str]:
     """Bybit linear perpetual piyasasinda gercekten islem goren sembolleri dondurur."""
-    markets = exchange.load_markets()
+    markets = exchange.markets if exchange.markets else exchange.load_markets()
     available = []
     for base in bases:
         unified = f"{base}/{QUOTE}:{QUOTE}"
@@ -274,7 +296,7 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
 # ----------------------------------------------------------------------
 
 def main():
-    exchange = build_exchange()
+    exchange = build_working_exchange()
 
     print("Bybit sembolleri kontrol ediliyor...")
     crypto_syms = get_available_symbols(exchange, CRYPTO_SYMBOLS)
