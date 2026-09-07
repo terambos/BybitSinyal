@@ -1,6 +1,11 @@
 """
-Bybit Coklu Zaman Dilimi Sinyal Botu
+Coklu Zaman Dilimi Kripto Sinyal Botu
 =====================================
+Veri kaynagi: Binance USDT-M Futures (Bybit'in genel API'si bulut/GitHub
+Actions IP araliklarini engelledigi icin veri buradan cekiliyor; sen yine de
+istedigin borsada - orn. Bybit'te - islem acabilirsin, buyuk coinlerin
+fiyatlari borsalar arasi pratikte ayni hareket eder).
+
 Strateji:
   - Trend filtresi: 1G (EMA200) + 4S (EMA50 > EMA200)
   - Tetikleyici (1S kapanisinda): RSI(14) 35 ustune/65 altina kesisi
@@ -39,13 +44,6 @@ CRYPTO_SYMBOLS = [
     "FET", "RENDER", "TIA", "DOGE", "SOL",
     # Kaliteli/hacimli ek coinler
     "LINK", "DOT", "NEAR", "INJ", "OP", "SEI",
-]
-
-# Bybit'te tokenize hisse senedi perpetuallari (varsa kullanilir, yoksa
-# script baslarken otomatik eleyip sessizce gecer)
-STOCK_CANDIDATES = [
-    "AVGO", "NVDA", "TSLA", "MSTR", "COIN",
-    "META", "MSFT", "AMZN", "AAPL", "GOOGL",
 ]
 
 QUOTE = "USDT"
@@ -109,37 +107,14 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # VERI CEKME
 # ----------------------------------------------------------------------
 
-# Bybit'in ana adresi (bybit.com) bazi bulut saglayicilarinin (GitHub Actions
-# dahil) IP araliklarini CloudFront seviyesinde engelliyor. Bu yuzden birden
-# fazla alternatif hostname deneyip calisanini kullaniyoruz.
-BYBIT_HOSTNAMES = ["bytick.com", "bybit.com", "bybit.nl"]
-
-
-def build_exchange(hostname: str) -> ccxt.bybit:
-    return ccxt.bybit({
+def build_exchange() -> ccxt.binanceusdm:
+    return ccxt.binanceusdm({
         "enableRateLimit": True,
-        "hostname": hostname,
-        "options": {"defaultType": "swap"},
     })
 
 
-def build_working_exchange() -> ccxt.bybit:
-    """Engellenmemis calisan bir Bybit hostname'i bulup exchange nesnesini dondurur."""
-    last_error = None
-    for hostname in BYBIT_HOSTNAMES:
-        exchange = build_exchange(hostname)
-        try:
-            exchange.load_markets()
-            print(f"Bybit'e '{hostname}' adresi uzerinden baglanildi.")
-            return exchange
-        except Exception as e:
-            print(f"'{hostname}' adresi calismadi, digeri deneniyor... ({e})", file=sys.stderr)
-            last_error = e
-    raise RuntimeError(f"Hicbir Bybit adresine baglanilamadi. Son hata: {last_error}")
-
-
-def get_available_symbols(exchange: ccxt.bybit, bases: list[str]) -> list[str]:
-    """Bybit linear perpetual piyasasinda gercekten islem goren sembolleri dondurur."""
+def get_available_symbols(exchange: ccxt.binanceusdm, bases: list[str]) -> list[str]:
+    """Binance USDT-M Futures piyasasinda gercekten islem goren sembolleri dondurur."""
     markets = exchange.markets if exchange.markets else exchange.load_markets()
     available = []
     for base in bases:
@@ -149,7 +124,7 @@ def get_available_symbols(exchange: ccxt.bybit, bases: list[str]) -> list[str]:
     return available
 
 
-def fetch_closed_ohlcv(exchange: ccxt.bybit, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+def fetch_closed_ohlcv(exchange: ccxt.binanceusdm, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     """OHLCV ceker ve henuz kapanmamis son mumu atar."""
     raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1)
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -165,7 +140,7 @@ def fetch_closed_ohlcv(exchange: ccxt.bybit, symbol: str, timeframe: str, limit:
 # STRATEJI
 # ----------------------------------------------------------------------
 
-def evaluate_symbol(exchange: ccxt.bybit, symbol: str) -> dict | None:
+def evaluate_symbol(exchange: ccxt.binanceusdm, symbol: str) -> dict | None:
     df_1d = fetch_closed_ohlcv(exchange, symbol, "1d", EMA_1D + 5)
     df_4h = fetch_closed_ohlcv(exchange, symbol, "4h", EMA_4H_SLOW + 5)
     df_1h = fetch_closed_ohlcv(exchange, symbol, "1h", max(VOLUME_MA_PERIOD, ATR_LOOKBACK) + RSI_PERIOD + 10)
@@ -296,22 +271,16 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
 # ----------------------------------------------------------------------
 
 def main():
-    exchange = build_working_exchange()
+    exchange = build_exchange()
 
-    print("Bybit sembolleri kontrol ediliyor...")
+    print("Binance sembolleri kontrol ediliyor...")
     crypto_syms = get_available_symbols(exchange, CRYPTO_SYMBOLS)
-    stock_syms = get_available_symbols(exchange, STOCK_CANDIDATES)
 
     missing_crypto = set(CRYPTO_SYMBOLS) - {s.split("/")[0] for s in crypto_syms}
     if missing_crypto:
-        print(f"UYARI: Bybit'te bulunamayan/aktif olmayan coinler atlandi: {sorted(missing_crypto)}")
+        print(f"UYARI: Binance'te bulunamayan/aktif olmayan coinler atlandi: {sorted(missing_crypto)}")
 
-    if stock_syms:
-        print(f"Hisse perpetuallari bulundu ve eklendi: {[s.split('/')[0] for s in stock_syms]}")
-    else:
-        print("Hicbir hisse perpetual'i bulunamadi, hisse taramasi atlandi.")
-
-    all_symbols = crypto_syms + stock_syms
+    all_symbols = crypto_syms
     print(f"Toplam taranan sembol sayisi: {len(all_symbols)}")
 
     state = load_state()
