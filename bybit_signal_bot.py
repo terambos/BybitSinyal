@@ -113,12 +113,15 @@ def build_exchange() -> ccxt.binanceusdm:
     })
     # GitHub Actions ABD'de calistigi ve Binance/Bybit ABD IP'lerini
     # engelledigi icin, ayarlanmissa istekleri ucretsiz bir Cloudflare
-    # Worker proxy'si uzerinden yonlendiriyoruz.
+    # Worker proxy'si uzerinden yonlendiriyoruz. ccxt'nin kendi proxyUrl
+    # ozelligi CI ortaminda cakisan proxy ayarlarina takilabildigi icin,
+    # bunun yerine dogrudan her endpoint URL'sinin basina proxy'yi ekliyoruz.
     proxy_url = os.environ.get("PROXY_URL", "").strip()
     if proxy_url:
         if not proxy_url.endswith("/"):
             proxy_url += "/"
-        exchange.proxyUrl = proxy_url
+        for key, original_url in list(exchange.urls["api"].items()):
+            exchange.urls["api"][key] = proxy_url + original_url
         print(f"Istekler proxy uzerinden gonderiliyor: {proxy_url}")
     return exchange
 
