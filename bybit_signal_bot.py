@@ -1,10 +1,12 @@
 """
-Coklu Zaman Dilimi Kripto Sinyal Botu
-=====================================
-Veri kaynagi: Binance USDT-M Futures (Bybit'in genel API'si bulut/GitHub
-Actions IP araliklarini engelledigi icin veri buradan cekiliyor; sen yine de
-istedigin borsada - orn. Bybit'te - islem acabilirsin, buyuk coinlerin
-fiyatlari borsalar arasi pratikte ayni hareket eder).
+Coklu Zaman Dilimi Kripto Sinyal Botu (Yahoo Finance veri kaynagi)
+====================================================================
+Binance ve Bybit'in genel API'leri GitHub Actions gibi bulut sunuculardan
+gelen istekleri engelledigi icin veri kaynagi olarak Yahoo Finance
+kullaniliyor (ucretsiz, API anahtari gerektirmiyor, bulut IP'lerini
+engellemiyor). Sen yine istedigin borsada - orn. Bybit'te - islem
+acabilirsin, buyuk coinlerin fiyatlari borsalar arasi pratikte ayni
+hareket eder.
 
 Strateji:
   - Trend filtresi: 1G (EMA200) + 4S (EMA50 > EMA200)
@@ -15,7 +17,9 @@ Strateji:
   - Trend YUKARI + tum LONG kosullari -> LONG sinyali
   - Trend ASAGI + tum SHORT kosullari -> SHORT sinyali
 
-Her calistiginda sadece en son KAPANMIS 1 saatlik mumu kontrol eder.
+Tum zaman dilimleri (1S, 4S, 1G) tek bir saatlik veri cekiminden
+turetiliyor (4S ve 1G, saatlik mumlardan yeniden ornekleniyor).
+
 Ayni sinyali tekrar tekrar mail atmamak icin state.json'da hafiza tutar.
 
 Calistirma: GitHub Actions ile saatte bir (bkz. .github/workflows/signal-bot.yml)
@@ -25,15 +29,18 @@ Gerekli ortam degiskenleri (GitHub Secrets):
   TO_EMAIL             -> sinyallerin gidecegi adres
 """
 
-import ccxt
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import smtplib
 import json
 import os
 import sys
+import warnings
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
+
+warnings.filterwarnings("ignore")
 
 # ----------------------------------------------------------------------
 # AYARLAR
@@ -46,24 +53,24 @@ CRYPTO_SYMBOLS = [
     "LINK", "DOT", "NEAR", "INJ", "OP", "SEI",
 ]
 
-QUOTE = "USDT"
+YF_SUFFIX = "-USD"          # Yahoo Finance kripto sembol formati (orn. BTC-USD)
+HISTORY_PERIOD = "730d"     # 1 saatlik veri icin Yahoo'nun izin verdigi max araligi
 
 RSI_PERIOD = 14
-RSI_LONG_LEVEL = 35     # RSI bu seviyenin USTUNE kesisirse LONG tetikleyici
-RSI_SHORT_LEVEL = 65    # RSI bu seviyenin ALTINA kesisirse SHORT tetikleyici
+RSI_LONG_LEVEL = 35
+RSI_SHORT_LEVEL = 65
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.5
 ATR_PERIOD = 14
 ATR_LOOKBACK = 50
-ATR_MIN_RATIO = 0.5     # ATR%, kendi 50 donemlik ortalamasinin en az yarisi olmali
+ATR_MIN_RATIO = 0.5
 
 EMA_1D = 200
 EMA_4H_FAST = 50
 EMA_4H_SLOW = 200
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-
 TR_TZ = timezone(timedelta(hours=3))
 
 
@@ -93,7 +100,7 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
+    high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
@@ -104,73 +111,68 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 # ----------------------------------------------------------------------
-# VERI CEKME
+# VERI CEKME (YAHOO FINANCE)
 # ----------------------------------------------------------------------
 
-def build_exchange() -> ccxt.binanceusdm:
-    exchange = ccxt.binanceusdm({
-        "enableRateLimit": True,
-    })
-    # GitHub Actions ABD'de calistigi ve Binance/Bybit ABD IP'lerini
-    # engelledigi icin, ayarlanmissa istekleri ucretsiz bir Cloudflare
-    # Worker proxy'si uzerinden yonlendiriyoruz. ccxt'nin kendi proxyUrl
-    # ozelligi CI ortaminda cakisan proxy ayarlarina takilabildigi icin,
-    # bunun yerine dogrudan her endpoint URL'sinin basina proxy'yi ekliyoruz.
-    proxy_url = os.environ.get("PROXY_URL", "").strip()
-    if proxy_url:
-        if not proxy_url.endswith("/"):
-            proxy_url += "/"
-        for key, original_url in list(exchange.urls["api"].items()):
-            exchange.urls["api"][key] = proxy_url + original_url
-        print(f"Istekler proxy uzerinden gonderiliyor: {proxy_url}")
-    return exchange
+def fetch_hourly_history(base: str) -> pd.DataFrame | None:
+    """Bir coin icin saatlik OHLCV verisini ceker. Bulamazsa None doner."""
+    ticker = f"{base}{YF_SUFFIX}"
+    try:
+        df = yf.Ticker(ticker).history(period=HISTORY_PERIOD, interval="1h", auto_adjust=False)
+    except Exception as e:
+        print(f"UYARI: {ticker} icin veri cekilemedi: {e}", file=sys.stderr)
+        return None
 
+    if df is None or df.empty or len(df) < ATR_LOOKBACK + RSI_PERIOD + 10:
+        return None
 
-def get_available_symbols(exchange: ccxt.binanceusdm, bases: list[str]) -> list[str]:
-    """Binance USDT-M Futures piyasasinda gercekten islem goren sembolleri dondurur."""
-    markets = exchange.markets if exchange.markets else exchange.load_markets()
-    available = []
-    for base in bases:
-        unified = f"{base}/{QUOTE}:{QUOTE}"
-        if unified in markets and markets[unified].get("active", True):
-            available.append(unified)
-    return available
+    df = df.reset_index()
+    dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
+    df = df.rename(columns={dt_col: "dt"})
+    df["dt"] = pd.to_datetime(df["dt"], utc=True)
 
-
-def fetch_closed_ohlcv(exchange: ccxt.binanceusdm, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """OHLCV ceker ve henuz kapanmamis son mumu atar."""
-    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1)
-    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-    tf_ms = exchange.parse_timeframe(timeframe) * 1000
-    now_ms = exchange.milliseconds()
-    if not df.empty and df["ts"].iloc[-1] + tf_ms > now_ms:
+    now = pd.Timestamp.now(tz="UTC")
+    if not df.empty and (df["dt"].iloc[-1] + pd.Timedelta(hours=1)) > now:
         df = df.iloc[:-1]
-    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df.reset_index(drop=True)
+
+    return df[["dt", "Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
+
+
+def resample(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
+    df = df_1h.set_index("dt")
+    out = df.resample(rule, label="right", closed="right").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }).dropna()
+    return out.reset_index()
 
 
 # ----------------------------------------------------------------------
 # STRATEJI
 # ----------------------------------------------------------------------
 
-def evaluate_symbol(exchange: ccxt.binanceusdm, symbol: str) -> dict | None:
-    df_1d = fetch_closed_ohlcv(exchange, symbol, "1d", EMA_1D + 5)
-    df_4h = fetch_closed_ohlcv(exchange, symbol, "4h", EMA_4H_SLOW + 5)
-    df_1h = fetch_closed_ohlcv(exchange, symbol, "1h", max(VOLUME_MA_PERIOD, ATR_LOOKBACK) + RSI_PERIOD + 10)
+def evaluate_symbol(base: str) -> dict | None:
+    df_1h = fetch_hourly_history(base)
+    if df_1h is None:
+        return None
+
+    df_4h = resample(df_1h, "4h")
+    df_1d = resample(df_1h, "1D")
 
     if len(df_1d) < EMA_1D or len(df_4h) < EMA_4H_SLOW or len(df_1h) < ATR_LOOKBACK + 2:
-        return None  # yeterli gecmis veri yok, atla
+        return None
 
-    # --- 1G trend ---
-    ema200_1d = ema(df_1d["close"], EMA_1D)
-    close_1d = df_1d["close"].iloc[-1]
+    ema200_1d = ema(df_1d["Close"], EMA_1D)
+    close_1d = df_1d["Close"].iloc[-1]
     trend_up_1d = close_1d > ema200_1d.iloc[-1]
     trend_down_1d = close_1d < ema200_1d.iloc[-1]
 
-    # --- 4S trend ---
-    ema50_4h = ema(df_4h["close"], EMA_4H_FAST)
-    ema200_4h = ema(df_4h["close"], EMA_4H_SLOW)
-    close_4h = df_4h["close"].iloc[-1]
+    ema50_4h = ema(df_4h["Close"], EMA_4H_FAST)
+    ema200_4h = ema(df_4h["Close"], EMA_4H_SLOW)
+    close_4h = df_4h["Close"].iloc[-1]
     trend_up_4h = (ema50_4h.iloc[-1] > ema200_4h.iloc[-1]) and (close_4h > ema50_4h.iloc[-1])
     trend_down_4h = (ema50_4h.iloc[-1] < ema200_4h.iloc[-1]) and (close_4h < ema50_4h.iloc[-1])
 
@@ -178,21 +180,20 @@ def evaluate_symbol(exchange: ccxt.binanceusdm, symbol: str) -> dict | None:
     trend_down = trend_down_1d and trend_down_4h
 
     if not (trend_up or trend_down):
-        return None  # trend belirsiz, sinyal aranmaz
+        return None
 
-    # --- 1S tetikleyici ---
-    rsi_1h = rsi(df_1h["close"], RSI_PERIOD)
-    macd_line, signal_line = macd(df_1h["close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    vol_ma = df_1h["volume"].rolling(VOLUME_MA_PERIOD).mean()
+    rsi_1h = rsi(df_1h["Close"], RSI_PERIOD)
+    macd_line, signal_line = macd(df_1h["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    vol_ma = df_1h["Volume"].rolling(VOLUME_MA_PERIOD).mean()
     atr_1h = atr(df_1h, ATR_PERIOD)
-    atr_pct = atr_1h / df_1h["close"]
+    atr_pct = atr_1h / df_1h["Close"]
     atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
 
-    i = len(df_1h) - 1  # en son kapanmis mum
+    i = len(df_1h) - 1
     rsi_now, rsi_prev = rsi_1h.iloc[i], rsi_1h.iloc[i - 1]
     macd_now, macd_prev = macd_line.iloc[i], macd_line.iloc[i - 1]
     sig_now, sig_prev = signal_line.iloc[i], signal_line.iloc[i - 1]
-    vol_now = df_1h["volume"].iloc[i]
+    vol_now = df_1h["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
 
     rsi_cross_up = (rsi_prev < RSI_LONG_LEVEL) and (rsi_now >= RSI_LONG_LEVEL)
@@ -211,13 +212,13 @@ def evaluate_symbol(exchange: ccxt.binanceusdm, symbol: str) -> dict | None:
     if direction is None:
         return None
 
-    candle_ts = int(df_1h["ts"].iloc[i])
+    candle_ts = int(df_1h["dt"].iloc[i].timestamp() * 1000)
 
     return {
-        "symbol": symbol,
+        "symbol": base,
         "direction": direction,
         "candle_ts": candle_ts,
-        "price": float(df_1h["close"].iloc[i]),
+        "price": float(df_1h["Close"].iloc[i]),
         "rsi": round(float(rsi_now), 1),
         "macd": round(float(macd_now), 6),
         "signal_line": round(float(sig_now), 6),
@@ -262,11 +263,10 @@ def send_email(subject: str, body: str) -> None:
 
 
 def format_signal_email(sig: dict) -> tuple[str, str]:
-    base = sig["symbol"].split("/")[0]
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
-    subject = f"[SINYAL] {base} {sig['direction']} - 1S kapanis"
+    subject = f"[SINYAL] {sig['symbol']} {sig['direction']} - 1S kapanis"
     body = (
-        f"{base} icin {sig['direction']} sinyali olustu.\n\n"
+        f"{sig['symbol']} icin {sig['direction']} sinyali olustu.\n\n"
         f"Mum kapanis zamani (TR): {dt_tr.strftime('%d.%m.%Y %H:%M')}\n"
         f"Fiyat: {sig['price']}\n"
         f"RSI(14): {sig['rsi']}\n"
@@ -274,7 +274,7 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
         f"Hacim / 20-ort. oran: {sig['volume_ratio']}\n"
         f"ATR: %{sig['atr_pct']}\n\n"
         f"Kosullar: 1G+4S trend teyidi, 1S RSI/MACD kesisimi, hacim patlamasi, ATR filtresi.\n"
-        f"Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
+        f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
     return subject, body
 
@@ -284,26 +284,16 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
 # ----------------------------------------------------------------------
 
 def main():
-    exchange = build_exchange()
-
-    print("Binance sembolleri kontrol ediliyor...")
-    crypto_syms = get_available_symbols(exchange, CRYPTO_SYMBOLS)
-
-    missing_crypto = set(CRYPTO_SYMBOLS) - {s.split("/")[0] for s in crypto_syms}
-    if missing_crypto:
-        print(f"UYARI: Binance'te bulunamayan/aktif olmayan coinler atlandi: {sorted(missing_crypto)}")
-
-    all_symbols = crypto_syms
-    print(f"Toplam taranan sembol sayisi: {len(all_symbols)}")
+    print(f"Toplam taranan sembol sayisi: {len(CRYPTO_SYMBOLS)}")
 
     state = load_state()
     new_signals = []
 
-    for symbol in all_symbols:
+    for base in CRYPTO_SYMBOLS:
         try:
-            result = evaluate_symbol(exchange, symbol)
+            result = evaluate_symbol(base)
         except Exception as e:
-            print(f"HATA ({symbol}): {e}", file=sys.stderr)
+            print(f"HATA ({base}): {e}", file=sys.stderr)
             continue
 
         if result is None:
@@ -313,7 +303,7 @@ def main():
         last_sent_ts = state.get(key)
 
         if last_sent_ts == result["candle_ts"]:
-            continue  # bu mum icin zaten mail atildi
+            continue
 
         new_signals.append(result)
         state[key] = result["candle_ts"]
