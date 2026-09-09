@@ -4,10 +4,10 @@ on:
   schedule:
     # Her saat basi + 5 dakika (mumun tam kapanmasini garantilemek icin)
     - cron: "5 * * * *"
-  workflow_dispatch: {}   # istersen GitHub arayuzunden elle de calistirabilirsin
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # state.json'u geri commitleyebilmek icin
+  contents: write
 
 jobs:
   run-bot:
@@ -29,7 +29,6 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python bybit_signal_bot.py
 
       - name: Durumu (state.json) geri kaydet
