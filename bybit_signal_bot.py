@@ -51,6 +51,7 @@ CRYPTO_SYMBOLS = [
     "FET", "RENDER", "TIA", "DOGE", "SOL",
     # Kaliteli/hacimli ek coinler
     "LINK", "DOT", "NEAR", "INJ", "OP", "SEI",
+    "BNB", "SHIB", "TAO", "ENA", "ATOM", "ALGO",
 ]
 
 YF_SUFFIX = "-USD"          # Yahoo Finance kripto sembol formati (orn. BTC-USD)
