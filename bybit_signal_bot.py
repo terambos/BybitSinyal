@@ -51,7 +51,6 @@ CRYPTO_SYMBOLS = [
     "FET", "RENDER", "TIA", "DOGE", "SOL",
     # Kaliteli/hacimli ek coinler
     "LINK", "DOT", "NEAR", "INJ", "OP", "SEI",
-    "BNB", "SHIB", "TAO", "ENA", "ATOM", "ALGO",
 ]
 
 YF_SUFFIX = "-USD"          # Yahoo Finance kripto sembol formati (orn. BTC-USD)
@@ -286,6 +285,19 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
 
 def main():
     print(f"Toplam taranan sembol sayisi: {len(CRYPTO_SYMBOLS)}")
+
+    if os.environ.get("TEST_EMAIL", "").strip().lower() == "true":
+        print("TEST MODU: deneme maili gonderiliyor...")
+        try:
+            send_email(
+                "[TEST] Sinyal Botu Mail Kontrolu",
+                "Bu bir test mailidir. Bu maili aldiysan, mail gonderim sistemi "
+                "calisiyor demektir. Gercek sinyaller ayni formatta gelecek.\n"
+            )
+            print("TEST MAILI GONDERILDI. Gelen kutunu (ve spam klasorunu) kontrol et.")
+        except Exception as e:
+            print(f"TEST MAIL HATASI: {e}", file=sys.stderr)
+        return
 
     state = load_state()
     new_signals = []
