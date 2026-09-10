@@ -2,9 +2,13 @@ name: Kripto Sinyal Botu
 
 on:
   schedule:
-    # Her saat basi + 5 dakika (mumun tam kapanmasini garantilemek icin)
     - cron: "5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Sadece test maili gonder (gercek tarama yapma)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -29,6 +33,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          TEST_EMAIL: ${{ inputs.test_email }}
         run: python bybit_signal_bot.py
 
       - name: Durumu (state.json) geri kaydet
