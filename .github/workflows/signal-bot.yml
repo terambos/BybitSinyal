@@ -1,8 +1,6 @@
 name: Kripto Sinyal Botu
 
 on:
-  schedule:
-    - cron: "5 * * * *"
   workflow_dispatch:
     inputs:
       test_email:
