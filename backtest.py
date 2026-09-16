@@ -38,17 +38,23 @@ CRYPTO_SYMBOLS = [
 ]
 
 YF_SUFFIX = "-USD"
+YF_TICKER_OVERRIDES = {
+    "SUI": "SUI20947",
+    "HYPE": "HYPE32196",
+    "APT": "APT21794",
+    "TAO": "TAO22974",
+}
 TREND_PERIOD = "730d"
 TREND_INTERVAL = "1h"
 TRIGGER_PERIOD = "60d"
 TRIGGER_INTERVAL = "15m"
 
 RSI_PERIOD = 14
-RSI_LONG_LEVEL = 35
-RSI_SHORT_LEVEL = 65
+RSI_LONG_LEVEL = 40       # (eskisi: 35) - hafif gevsetildi
+RSI_SHORT_LEVEL = 60      # (eskisi: 65)
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.5
+VOLUME_SPIKE_MULT = 1.2   # (eskisi: 1.5)
 ATR_PERIOD = 14
 ATR_LOOKBACK = 50
 ATR_MIN_RATIO = 0.5
@@ -107,7 +113,7 @@ def fetch_history(base, period, interval, retries=4):
     Veriyi ceker. Yahoo Finance cok sik istek gelince (rate limit) bos cevap
     dondurdugu icin, basarisiz olursa gittikce artan surelerle tekrar dener.
     """
-    ticker = f"{base}{YF_SUFFIX}"
+    ticker = f"{YF_TICKER_OVERRIDES.get(base, base)}{YF_SUFFIX}"
     df = None
     for attempt in range(retries):
         try:
