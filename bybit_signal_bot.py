@@ -9,20 +9,22 @@ acabilirsin, buyuk coinlerin fiyatlari borsalar arasi pratikte ayni
 hareket eder.
 
 Strateji:
-  - Trend filtresi: 1G (EMA200) + 4S (EMA50 > EMA200)
-  - Tetikleyici (1S kapanisinda): RSI(14) 35 ustune/65 altina kesisi
-                                   + MACD kesisimi
-                                   + Hacim patlamasi (SMA20'nin 1.5 kati)
-                                   + ATR volatilite filtresi
+  - Trend filtresi: 1G (EMA200) + 4S (EMA50 > EMA200) - saatlik veriden turetilir
+  - Tetikleyici (15 DAKIKALIK mum kapanisinda, daha hizli reaksiyon icin):
+        RSI(14) 35 ustune/65 altina kesisi
+      + MACD kesisimi
+      + Hacim patlamasi (SMA20'nin 1.5 kati)
+      + ATR volatilite filtresi
   - Trend YUKARI + tum LONG kosullari -> LONG sinyali
   - Trend ASAGI + tum SHORT kosullari -> SHORT sinyali
 
-Tum zaman dilimleri (1S, 4S, 1G) tek bir saatlik veri cekiminden
-turetiliyor (4S ve 1G, saatlik mumlardan yeniden ornekleniyor).
+Trend (1G/4S) daha yavas degistigi icin saatlik veriden, tetikleyici
+(RSI/MACD/hacim/ATR) daha hizli reaksiyon icin 15 dakikalik veriden
+hesaplanir. Bu sayede saat icindeki ani hareketler de yakalanir.
 
 Ayni sinyali tekrar tekrar mail atmamak icin state.json'da hafiza tutar.
 
-Calistirma: GitHub Actions ile saatte bir (bkz. .github/workflows/signal-bot.yml)
+Calistirma: GitHub Actions ile her 15 dakikada bir (bkz. .github/workflows/signal-bot.yml)
 Gerekli ortam degiskenleri (GitHub Secrets):
   GMAIL_ADDRESS        -> gonderen gmail adresi
   GMAIL_APP_PASSWORD   -> 16 haneli Gmail uygulama sifresi
@@ -54,14 +56,26 @@ CRYPTO_SYMBOLS = [
 ]
 
 YF_SUFFIX = "-USD"          # Yahoo Finance kripto sembol formati (orn. BTC-USD)
-HISTORY_PERIOD = "730d"     # 1 saatlik veri icin Yahoo'nun izin verdigi max araligi
+# Bazi coinlerin Yahoo'da normal kod yerine sayili ozel kodu var (ayni isimde
+# baska varliklarla karismasin diye). Bunlar dogru kod verilmezse "bulunamadi"
+# hatasi alinir.
+YF_TICKER_OVERRIDES = {
+    "SUI": "SUI20947",
+    "HYPE": "HYPE32196",
+    "APT": "APT21794",
+    "TAO": "TAO22974",
+}
+TREND_PERIOD = "730d"       # Trend (1G/4S) icin saatlik veri araligi
+TREND_INTERVAL = "1h"
+TRIGGER_PERIOD = "60d"      # Tetikleyici (RSI/MACD/hacim/ATR) icin 15dk veri araligi
+TRIGGER_INTERVAL = "15m"
 
 RSI_PERIOD = 14
-RSI_LONG_LEVEL = 35
-RSI_SHORT_LEVEL = 65
+RSI_LONG_LEVEL = 40       # (eskisi: 35) - hafif gevsetildi, daha sik ama hala anlamli sinyal
+RSI_SHORT_LEVEL = 60      # (eskisi: 65)
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.5
+VOLUME_SPIKE_MULT = 1.2   # (eskisi: 1.5) - hacim sarti hafif gevsetildi
 ATR_PERIOD = 14
 ATR_LOOKBACK = 50
 ATR_MIN_RATIO = 0.5
@@ -114,16 +128,16 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # VERI CEKME (YAHOO FINANCE)
 # ----------------------------------------------------------------------
 
-def fetch_hourly_history(base: str) -> pd.DataFrame | None:
-    """Bir coin icin saatlik OHLCV verisini ceker. Bulamazsa None doner."""
-    ticker = f"{base}{YF_SUFFIX}"
+def fetch_history(base: str, period: str, interval: str) -> pd.DataFrame | None:
+    """Bir coin icin OHLCV verisini ceker. Bulamazsa None doner."""
+    ticker = f"{YF_TICKER_OVERRIDES.get(base, base)}{YF_SUFFIX}"
     try:
-        df = yf.Ticker(ticker).history(period=HISTORY_PERIOD, interval="1h", auto_adjust=False)
+        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
     except Exception as e:
-        print(f"UYARI: {ticker} icin veri cekilemedi: {e}", file=sys.stderr)
+        print(f"UYARI: {ticker} ({interval}) icin veri cekilemedi: {e}", file=sys.stderr)
         return None
 
-    if df is None or df.empty or len(df) < ATR_LOOKBACK + RSI_PERIOD + 10:
+    if df is None or df.empty:
         return None
 
     df = df.reset_index()
@@ -131,8 +145,11 @@ def fetch_hourly_history(base: str) -> pd.DataFrame | None:
     df = df.rename(columns={dt_col: "dt"})
     df["dt"] = pd.to_datetime(df["dt"], utc=True)
 
+    # Henuz tam kapanmamis olabilecek son mumu at
+    interval_map = {"15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1)}
+    step = interval_map.get(interval, pd.Timedelta(hours=1))
     now = pd.Timestamp.now(tz="UTC")
-    if not df.empty and (df["dt"].iloc[-1] + pd.Timedelta(hours=1)) > now:
+    if not df.empty and (df["dt"].iloc[-1] + step) > now:
         df = df.iloc[:-1]
 
     return df[["dt", "Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
@@ -155,14 +172,15 @@ def resample(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 
 def evaluate_symbol(base: str) -> dict | None:
-    df_1h = fetch_hourly_history(base)
-    if df_1h is None:
+    # Trend (1G/4S) icin saatlik veri
+    df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
+    if df_trend_1h is None or len(df_trend_1h) < EMA_1D * 24:
         return None
 
-    df_4h = resample(df_1h, "4h")
-    df_1d = resample(df_1h, "1D")
+    df_4h = resample(df_trend_1h, "4h")
+    df_1d = resample(df_trend_1h, "1D")
 
-    if len(df_1d) < EMA_1D or len(df_4h) < EMA_4H_SLOW or len(df_1h) < ATR_LOOKBACK + 2:
+    if len(df_1d) < EMA_1D or len(df_4h) < EMA_4H_SLOW:
         return None
 
     ema200_1d = ema(df_1d["Close"], EMA_1D)
@@ -182,18 +200,23 @@ def evaluate_symbol(base: str) -> dict | None:
     if not (trend_up or trend_down):
         return None
 
-    rsi_1h = rsi(df_1h["Close"], RSI_PERIOD)
-    macd_line, signal_line = macd(df_1h["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    vol_ma = df_1h["Volume"].rolling(VOLUME_MA_PERIOD).mean()
-    atr_1h = atr(df_1h, ATR_PERIOD)
-    atr_pct = atr_1h / df_1h["Close"]
+    # Tetikleyici (hizli reaksiyon icin 15 dakikalik veri)
+    df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
+    if df_trig is None or len(df_trig) < ATR_LOOKBACK + RSI_PERIOD + 10:
+        return None
+
+    rsi_trig = rsi(df_trig["Close"], RSI_PERIOD)
+    macd_line, signal_line = macd(df_trig["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    vol_ma = df_trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
+    atr_trig = atr(df_trig, ATR_PERIOD)
+    atr_pct = atr_trig / df_trig["Close"]
     atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
 
-    i = len(df_1h) - 1
-    rsi_now, rsi_prev = rsi_1h.iloc[i], rsi_1h.iloc[i - 1]
+    i = len(df_trig) - 1
+    rsi_now, rsi_prev = rsi_trig.iloc[i], rsi_trig.iloc[i - 1]
     macd_now, macd_prev = macd_line.iloc[i], macd_line.iloc[i - 1]
     sig_now, sig_prev = signal_line.iloc[i], signal_line.iloc[i - 1]
-    vol_now = df_1h["Volume"].iloc[i]
+    vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
 
     rsi_cross_up = (rsi_prev < RSI_LONG_LEVEL) and (rsi_now >= RSI_LONG_LEVEL)
@@ -212,13 +235,13 @@ def evaluate_symbol(base: str) -> dict | None:
     if direction is None:
         return None
 
-    candle_ts = int(df_1h["dt"].iloc[i].timestamp() * 1000)
+    candle_ts = int(df_trig["dt"].iloc[i].timestamp() * 1000)
 
     return {
         "symbol": base,
         "direction": direction,
         "candle_ts": candle_ts,
-        "price": float(df_1h["Close"].iloc[i]),
+        "price": float(df_trig["Close"].iloc[i]),
         "rsi": round(float(rsi_now), 1),
         "macd": round(float(macd_now), 6),
         "signal_line": round(float(sig_now), 6),
@@ -264,16 +287,17 @@ def send_email(subject: str, body: str) -> None:
 
 def format_signal_email(sig: dict) -> tuple[str, str]:
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
-    subject = f"[SINYAL] {sig['symbol']} {sig['direction']} - 1S kapanis"
+    subject = f"[SINYAL] {sig['symbol']} {sig['direction']} - 15dk kapanis"
     body = (
         f"{sig['symbol']} icin {sig['direction']} sinyali olustu.\n\n"
         f"Mum kapanis zamani (TR): {dt_tr.strftime('%d.%m.%Y %H:%M')}\n"
         f"Fiyat: {sig['price']}\n"
-        f"RSI(14): {sig['rsi']}\n"
+        f"RSI(14, 15dk): {sig['rsi']}\n"
         f"MACD: {sig['macd']}  |  Sinyal cizgisi: {sig['signal_line']}\n"
         f"Hacim / 20-ort. oran: {sig['volume_ratio']}\n"
         f"ATR: %{sig['atr_pct']}\n\n"
-        f"Kosullar: 1G+4S trend teyidi, 1S RSI/MACD kesisimi, hacim patlamasi, ATR filtresi.\n"
+        f"Kosullar: 1G+4S trend teyidi (saatlik veriden), 15dk RSI/MACD kesisimi, "
+        f"hacim patlamasi, ATR filtresi.\n"
         f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
     return subject, body
