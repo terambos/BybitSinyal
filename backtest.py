@@ -229,22 +229,23 @@ def backtest_symbol(base: str):
     volume_spike = (trig["vol_ma"] > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * trig["vol_ma"])
     atr_ok = trig["atr_pct_avg"].notna() & (trig["atr_pct"] >= ATR_MIN_RATIO * trig["atr_pct_avg"])
 
-    has_trigger = rsi_cross_up | rsi_cross_down | macd_cross_up | macd_cross_down
+    # Kapi: RSI VE MACD kesisiminin AYNI YONDE, AYNI ANDA olmasi sart
+    long_kapi = rsi_cross_up & macd_cross_up
+    short_kapi = rsi_cross_down & macd_cross_down
+    has_trigger = long_kapi | short_kapi
 
-    long_puan = (
+    long_puan = long_kapi.astype(int) * (
         trig["trend_up_1d"].astype(int) * PUAN_TREND_1G
         + trig["trend_up_4h"].astype(int) * PUAN_TREND_4S
         + rsi_4h_bullish.astype(int) * PUAN_RSI_4S_YON
-        + rsi_cross_up.astype(int) * PUAN_RSI_KESISIM
-        + macd_cross_up.astype(int) * PUAN_MACD_KESISIM
+        + (PUAN_RSI_KESISIM + PUAN_MACD_KESISIM)
         + volume_spike.astype(int) * PUAN_HACIM
     )
-    short_puan = (
+    short_puan = short_kapi.astype(int) * (
         trig["trend_down_1d"].astype(int) * PUAN_TREND_1G
         + trig["trend_down_4h"].astype(int) * PUAN_TREND_4S
         + rsi_4h_bearish.astype(int) * PUAN_RSI_4S_YON
-        + rsi_cross_down.astype(int) * PUAN_RSI_KESISIM
-        + macd_cross_down.astype(int) * PUAN_MACD_KESISIM
+        + (PUAN_RSI_KESISIM + PUAN_MACD_KESISIM)
         + volume_spike.astype(int) * PUAN_HACIM
     )
 
