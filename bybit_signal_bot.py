@@ -125,6 +125,20 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 # ----------------------------------------------------------------------
+# GUVEN SKORU AGIRLIKLARI (toplam 10 puan)
+# ----------------------------------------------------------------------
+PUAN_TREND_1G = 2
+PUAN_TREND_4S = 2
+PUAN_RSI_4S_YON = 1
+PUAN_RSI_KESISIM = 2
+PUAN_MACD_KESISIM = 2
+PUAN_HACIM = 1
+MAX_PUAN = PUAN_TREND_1G + PUAN_TREND_4S + PUAN_RSI_4S_YON + PUAN_RSI_KESISIM + PUAN_MACD_KESISIM + PUAN_HACIM  # 10
+ESIK_ORTA_GUVEN = 5
+ESIK_YUKSEK_GUVEN = 8
+
+
+# ----------------------------------------------------------------------
 # VERI CEKME (YAHOO FINANCE)
 # ----------------------------------------------------------------------
 
@@ -194,10 +208,13 @@ def evaluate_symbol(base: str) -> dict | None:
     trend_up_4h = (ema50_4h.iloc[-1] > ema200_4h.iloc[-1]) and (close_4h > ema50_4h.iloc[-1])
     trend_down_4h = (ema50_4h.iloc[-1] < ema200_4h.iloc[-1]) and (close_4h < ema50_4h.iloc[-1])
 
-    trend_up = trend_up_1d and trend_up_4h
-    trend_down = trend_down_1d and trend_down_4h
+    # 4 saatlik RSI - yon destegi icin (50 ustu = boga, 50 alti = ayi momentumu)
+    rsi_4h = rsi(df_4h["Close"], RSI_PERIOD)
+    rsi_4h_now = rsi_4h.iloc[-1]
+    rsi_4h_bullish = rsi_4h_now > 50
+    rsi_4h_bearish = rsi_4h_now < 50
 
-    if not (trend_up or trend_down):
+    if not (trend_up_1d or trend_down_1d or trend_up_4h or trend_down_4h):
         return None
 
     # Tetikleyici (hizli reaksiyon icin 15 dakikalik veri)
@@ -226,20 +243,57 @@ def evaluate_symbol(base: str) -> dict | None:
     volume_spike = vol_ma_now > 0 and vol_now >= VOLUME_SPIKE_MULT * vol_ma_now
     atr_ok = pd.notna(atr_pct_avg.iloc[i]) and atr_pct.iloc[i] >= ATR_MIN_RATIO * atr_pct_avg.iloc[i]
 
-    direction = None
-    if trend_up and rsi_cross_up and macd_cross_up and volume_spike and atr_ok:
-        direction = "LONG"
-    elif trend_down and rsi_cross_down and macd_cross_down and volume_spike and atr_ok:
-        direction = "SHORT"
-
-    if direction is None:
+    if not atr_ok:
         return None
+
+    if not (rsi_cross_up or rsi_cross_down or macd_cross_up or macd_cross_down):
+        return None
+
+    long_puan = 0
+    if trend_up_1d:
+        long_puan += PUAN_TREND_1G
+    if trend_up_4h:
+        long_puan += PUAN_TREND_4S
+    if rsi_4h_bullish:
+        long_puan += PUAN_RSI_4S_YON
+    if rsi_cross_up:
+        long_puan += PUAN_RSI_KESISIM
+    if macd_cross_up:
+        long_puan += PUAN_MACD_KESISIM
+    if volume_spike:
+        long_puan += PUAN_HACIM
+
+    short_puan = 0
+    if trend_down_1d:
+        short_puan += PUAN_TREND_1G
+    if trend_down_4h:
+        short_puan += PUAN_TREND_4S
+    if rsi_4h_bearish:
+        short_puan += PUAN_RSI_4S_YON
+    if rsi_cross_down:
+        short_puan += PUAN_RSI_KESISIM
+    if macd_cross_down:
+        short_puan += PUAN_MACD_KESISIM
+    if volume_spike:
+        short_puan += PUAN_HACIM
+
+    if long_puan >= short_puan:
+        direction, puan = "LONG", long_puan
+    else:
+        direction, puan = "SHORT", short_puan
+
+    if puan < ESIK_ORTA_GUVEN:
+        return None
+
+    guven_etiketi = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
 
     candle_ts = int(df_trig["dt"].iloc[i].timestamp() * 1000)
 
     return {
         "symbol": base,
         "direction": direction,
+        "puan": puan,
+        "guven": guven_etiketi,
         "candle_ts": candle_ts,
         "price": float(df_trig["Close"].iloc[i]),
         "rsi": round(float(rsi_now), 1),
@@ -287,17 +341,19 @@ def send_email(subject: str, body: str) -> None:
 
 def format_signal_email(sig: dict) -> tuple[str, str]:
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
-    subject = f"[SINYAL] {sig['symbol']} {sig['direction']} - 15dk kapanis"
+    guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
+    subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
     body = (
-        f"{sig['symbol']} icin {sig['direction']} sinyali olustu.\n\n"
+        f"{sig['symbol']} icin {sig['direction']} sinyali olustu. [{guven_tr}: {sig['puan']}/{MAX_PUAN} puan]\n\n"
         f"Mum kapanis zamani (TR): {dt_tr.strftime('%d.%m.%Y %H:%M')}\n"
         f"Fiyat: {sig['price']}\n"
         f"RSI(14, 15dk): {sig['rsi']}\n"
         f"MACD: {sig['macd']}  |  Sinyal cizgisi: {sig['signal_line']}\n"
         f"Hacim / 20-ort. oran: {sig['volume_ratio']}\n"
         f"ATR: %{sig['atr_pct']}\n\n"
-        f"Kosullar: 1G+4S trend teyidi (saatlik veriden), 15dk RSI/MACD kesisimi, "
-        f"hacim patlamasi, ATR filtresi.\n"
+        f"Guven puani {sig['puan']}/{MAX_PUAN} - 8+ Yuksek, 5-7 Orta guven demektir.\n"
+        f"Puanlama: 1G trend(2) + 4S trend(2) + 4S RSI yonu(1) + 15dk RSI kesisimi(2) "
+        f"+ 15dk MACD kesisimi(2) + hacim patlamasi(1). ATR filtresi ayrica zorunlu kapi.\n"
         f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
     return subject, body
