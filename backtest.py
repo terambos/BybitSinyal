@@ -147,6 +147,18 @@ def resample(df_1h, rule):
     return out.reset_index()
 
 
+# GUVEN SKORU AGIRLIKLARI (toplam 10 puan) - canli botla birebir ayni
+PUAN_TREND_1G = 2
+PUAN_TREND_4S = 2
+PUAN_RSI_4S_YON = 1
+PUAN_RSI_KESISIM = 2
+PUAN_MACD_KESISIM = 2
+PUAN_HACIM = 1
+MAX_PUAN = PUAN_TREND_1G + PUAN_TREND_4S + PUAN_RSI_4S_YON + PUAN_RSI_KESISIM + PUAN_MACD_KESISIM + PUAN_HACIM
+ESIK_ORTA_GUVEN = 5
+ESIK_YUKSEK_GUVEN = 8
+
+
 # ----------------------------------------------------------------------
 # TUM GECMIS ICIN SINYAL TARAMASI (vektorel)
 # ----------------------------------------------------------------------
@@ -185,8 +197,17 @@ def backtest_symbol(base: str):
     trig = df_trig.sort_values("dt").reset_index(drop=True)
     trig = pd.merge_asof(trig, df_1d[["dt", "trend_up_1d", "trend_down_1d"]], on="dt", direction="backward")
     trig = pd.merge_asof(trig, df_4h[["dt", "trend_up_4h", "trend_down_4h"]], on="dt", direction="backward")
-    trig["trend_up"] = trig["trend_up_1d"].fillna(False) & trig["trend_up_4h"].fillna(False)
-    trig["trend_down"] = trig["trend_down_1d"].fillna(False) & trig["trend_down_4h"].fillna(False)
+    trig["trend_up_1d"] = trig["trend_up_1d"].fillna(False)
+    trig["trend_down_1d"] = trig["trend_down_1d"].fillna(False)
+    trig["trend_up_4h"] = trig["trend_up_4h"].fillna(False)
+    trig["trend_down_4h"] = trig["trend_down_4h"].fillna(False)
+
+    # 4 saatlik RSI de trigger zaman damgalarina eslenir
+    df_4h = df_4h.copy()
+    df_4h["rsi_4h"] = rsi(df_4h["Close"], RSI_PERIOD)
+    trig = pd.merge_asof(trig, df_4h[["dt", "rsi_4h"]], on="dt", direction="backward")
+    rsi_4h_bullish = trig["rsi_4h"] > 50
+    rsi_4h_bearish = trig["rsi_4h"] < 50
 
     trig["rsi"] = rsi(trig["Close"], RSI_PERIOD)
     macd_line, signal_line = macd(trig["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
@@ -208,10 +229,34 @@ def backtest_symbol(base: str):
     volume_spike = (trig["vol_ma"] > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * trig["vol_ma"])
     atr_ok = trig["atr_pct_avg"].notna() & (trig["atr_pct"] >= ATR_MIN_RATIO * trig["atr_pct_avg"])
 
-    long_signal = trig["trend_up"] & rsi_cross_up & macd_cross_up & volume_spike & atr_ok
-    short_signal = trig["trend_down"] & rsi_cross_down & macd_cross_down & volume_spike & atr_ok
+    has_trigger = rsi_cross_up | rsi_cross_down | macd_cross_up | macd_cross_down
 
-    trig["direction"] = np.where(long_signal, "LONG", np.where(short_signal, "SHORT", None))
+    long_puan = (
+        trig["trend_up_1d"].astype(int) * PUAN_TREND_1G
+        + trig["trend_up_4h"].astype(int) * PUAN_TREND_4S
+        + rsi_4h_bullish.astype(int) * PUAN_RSI_4S_YON
+        + rsi_cross_up.astype(int) * PUAN_RSI_KESISIM
+        + macd_cross_up.astype(int) * PUAN_MACD_KESISIM
+        + volume_spike.astype(int) * PUAN_HACIM
+    )
+    short_puan = (
+        trig["trend_down_1d"].astype(int) * PUAN_TREND_1G
+        + trig["trend_down_4h"].astype(int) * PUAN_TREND_4S
+        + rsi_4h_bearish.astype(int) * PUAN_RSI_4S_YON
+        + rsi_cross_down.astype(int) * PUAN_RSI_KESISIM
+        + macd_cross_down.astype(int) * PUAN_MACD_KESISIM
+        + volume_spike.astype(int) * PUAN_HACIM
+    )
+
+    direction = np.where(long_puan >= short_puan, "LONG", "SHORT")
+    puan = np.where(long_puan >= short_puan, long_puan, short_puan)
+    guven = np.where(puan >= ESIK_YUKSEK_GUVEN, "YUKSEK", "ORTA")
+
+    sinyal_var = atr_ok & has_trigger & (puan >= ESIK_ORTA_GUVEN)
+
+    trig["direction"] = np.where(sinyal_var, direction, None)
+    trig["puan"] = puan
+    trig["guven"] = np.where(sinyal_var, guven, None)
     signals = trig[trig["direction"].notna()].copy()
     signals["symbol"] = base
 
@@ -221,14 +266,13 @@ def backtest_symbol(base: str):
     for label, steps in HORIZONS.items():
         future_idx = signals.index + steps
         valid = future_idx < n
-        col = np.full(len(signals), np.nan)
         entry_prices = signals["Close"].values
         fut_prices = np.where(valid, closes[np.clip(future_idx, 0, n - 1)], np.nan)
         ret_long = (fut_prices / entry_prices - 1) * 100
         ret = np.where(signals["direction"].values == "LONG", ret_long, -ret_long)
         signals[f"getiri_{label}_%"] = np.round(ret, 2)
 
-    return signals[["symbol", "dt", "direction", "Close"] + [f"getiri_{h}_%" for h in HORIZONS]], True
+    return signals[["symbol", "dt", "direction", "puan", "guven", "Close"] + [f"getiri_{h}_%" for h in HORIZONS]], True
 
 
 # ----------------------------------------------------------------------
@@ -283,10 +327,24 @@ def main():
     print("\n" + "=" * 60)
     print(f"TOPLAM SINYAL SAYISI: {len(df)}")
     print(f"LONG: {(df['direction']=='LONG').sum()}  |  SHORT: {(df['direction']=='SHORT').sum()}")
+    print(f"YUKSEK GUVEN: {(df['guven']=='YUKSEK').sum()}  |  ORTA GUVEN: {(df['guven']=='ORTA').sum()}")
     print("=" * 60)
 
     print("\nSembol basina sinyal sayisi:")
     print(df["symbol"].value_counts().to_string())
+
+    print("\n" + "-" * 60)
+    print("GUVEN SEVIYESINE GORE PERFORMANS (24s getiri):")
+    print("-" * 60)
+    for guven_lvl in ["YUKSEK", "ORTA"]:
+        alt = df[df["guven"] == guven_lvl]
+        valid = alt["getiri_24s_%"].dropna()
+        if len(valid) == 0:
+            print(f"{guven_lvl}: sinyal yok")
+            continue
+        win_rate = (valid > 0).mean() * 100
+        print(f"{guven_lvl}: {len(alt)} sinyal | Kazanma orani: %{win_rate:.1f} | "
+              f"Ortalama getiri: %{valid.mean():.2f}")
 
     print("\n" + "-" * 60)
     print("ZAMAN DILIMINE GORE PERFORMANS (fees/slippage haric, basit ortalama):")
