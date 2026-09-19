@@ -246,36 +246,38 @@ def evaluate_symbol(base: str) -> dict | None:
     if not atr_ok:
         return None
 
-    if not (rsi_cross_up or rsi_cross_down or macd_cross_up or macd_cross_down):
+    # Kapi: RSI VE MACD kesisiminin AYNI YONDE, AYNI ANDA olmasi sart -
+    # sadece biri yeterli olsaydi (RSI 40/60 gibi ilimli seviyeler cok sik
+    # kesistigi icin) gurultu kadar sinyal uretirdi. Trend/hacim/4S RSI
+    # sadece GUVEN PUANINI belirliyor, kapiyi degil.
+    long_kapi = rsi_cross_up and macd_cross_up
+    short_kapi = rsi_cross_down and macd_cross_down
+    if not (long_kapi or short_kapi):
         return None
 
     long_puan = 0
-    if trend_up_1d:
-        long_puan += PUAN_TREND_1G
-    if trend_up_4h:
-        long_puan += PUAN_TREND_4S
-    if rsi_4h_bullish:
-        long_puan += PUAN_RSI_4S_YON
-    if rsi_cross_up:
-        long_puan += PUAN_RSI_KESISIM
-    if macd_cross_up:
-        long_puan += PUAN_MACD_KESISIM
-    if volume_spike:
-        long_puan += PUAN_HACIM
+    if long_kapi:
+        if trend_up_1d:
+            long_puan += PUAN_TREND_1G
+        if trend_up_4h:
+            long_puan += PUAN_TREND_4S
+        if rsi_4h_bullish:
+            long_puan += PUAN_RSI_4S_YON
+        long_puan += PUAN_RSI_KESISIM + PUAN_MACD_KESISIM
+        if volume_spike:
+            long_puan += PUAN_HACIM
 
     short_puan = 0
-    if trend_down_1d:
-        short_puan += PUAN_TREND_1G
-    if trend_down_4h:
-        short_puan += PUAN_TREND_4S
-    if rsi_4h_bearish:
-        short_puan += PUAN_RSI_4S_YON
-    if rsi_cross_down:
-        short_puan += PUAN_RSI_KESISIM
-    if macd_cross_down:
-        short_puan += PUAN_MACD_KESISIM
-    if volume_spike:
-        short_puan += PUAN_HACIM
+    if short_kapi:
+        if trend_down_1d:
+            short_puan += PUAN_TREND_1G
+        if trend_down_4h:
+            short_puan += PUAN_TREND_4S
+        if rsi_4h_bearish:
+            short_puan += PUAN_RSI_4S_YON
+        short_puan += PUAN_RSI_KESISIM + PUAN_MACD_KESISIM
+        if volume_spike:
+            short_puan += PUAN_HACIM
 
     if long_puan >= short_puan:
         direction, puan = "LONG", long_puan
