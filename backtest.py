@@ -66,6 +66,11 @@ EMA_4H_SLOW = 200
 # Sinyal sonrasi kac 15dk'lik mum ileriye bakilacak (1s=4, 4s=16, 24s=96, 3gun=288)
 HORIZONS = {"1s": 4, "4s": 16, "24s": 96, "3gun": 288}
 
+# Hedef yakalama analizi icin: sinyal sonrasi kac 15dk mum ileriye bakilacak
+# (3 gun = 288 mum, kullanicinin bazen birkac gun tuttugunu belirtmesine gore)
+MFE_HORIZON = 288
+HEDEF_YUZDELER = [3, 5, 7, 10]
+
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 
@@ -261,7 +266,7 @@ def backtest_symbol(base: str):
     signals = trig[trig["direction"].notna()].copy()
     signals["symbol"] = base
 
-    # Ileriye donuk getiriler
+    # Ileriye donuk getiriler (sabit sure sonundaki nokta getirisi)
     closes = trig["Close"].values
     n = len(trig)
     for label, steps in HORIZONS.items():
@@ -273,7 +278,42 @@ def backtest_symbol(base: str):
         ret = np.where(signals["direction"].values == "LONG", ret_long, -ret_long)
         signals[f"getiri_{label}_%"] = np.round(ret, 2)
 
-    return signals[["symbol", "dt", "direction", "puan", "guven", "Close"] + [f"getiri_{h}_%" for h in HORIZONS]], True
+    # MFE/MAE: sinyal sonrasi MFE_HORIZON mum icinde, herhangi bir anda
+    # ulasilan EN IYI (lehte) ve EN KOTU (aleyhte) hareket - "sinyalden sonra
+    # hedefe ulastim mi, yoksa hic ulasmadan mi kaldi" sorusuna cevap verir.
+    mfe_list, mae_list = [], []
+    hedef_kolonlari = {h: [] for h in HEDEF_YUZDELER}
+    for idx, row in signals.iterrows():
+        start = idx + 1
+        end = min(idx + 1 + MFE_HORIZON, n)
+        if start >= end:
+            mfe_list.append(np.nan)
+            mae_list.append(np.nan)
+            for h in HEDEF_YUZDELER:
+                hedef_kolonlari[h].append(False)
+            continue
+        window = closes[start:end]
+        entry = row["Close"]
+        if row["direction"] == "LONG":
+            pct_path = (window / entry - 1) * 100
+        else:
+            pct_path = (entry - window) / entry * 100
+        mfe = float(np.max(pct_path))
+        mae = float(np.min(pct_path))
+        mfe_list.append(round(mfe, 2))
+        mae_list.append(round(mae, 2))
+        for h in HEDEF_YUZDELER:
+            hedef_kolonlari[h].append(bool(mfe >= h))
+
+    signals["mfe_%"] = mfe_list       # sinyalden sonra ulasilan en iyi hareket
+    signals["mae_%"] = mae_list       # sinyalden sonra ulasilan en kotu hareket (once bu gorulebilir)
+    for h in HEDEF_YUZDELER:
+        signals[f"hedef_%{h}_ulasti"] = hedef_kolonlari[h]
+
+    kolonlar = (["symbol", "dt", "direction", "puan", "guven", "Close", "mfe_%", "mae_%"]
+                + [f"getiri_{h}_%" for h in HORIZONS]
+                + [f"hedef_%{h}_ulasti" for h in HEDEF_YUZDELER])
+    return signals[kolonlar], True
 
 
 # ----------------------------------------------------------------------
@@ -346,9 +386,28 @@ def main():
         win_rate = (valid > 0).mean() * 100
         print(f"{guven_lvl}: {len(alt)} sinyal | Kazanma orani: %{win_rate:.1f} | "
               f"Ortalama getiri: %{valid.mean():.2f}")
+        for h in [5, 10]:
+            col = f"hedef_%{h}_ulasti"
+            oran = alt[col].mean() * 100
+            print(f"    -> %{h} hedefe ulasan oran: %{oran:.1f}")
 
     print("\n" + "-" * 60)
-    print("ZAMAN DILIMINE GORE PERFORMANS (fees/slippage haric, basit ortalama):")
+    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde, HERHANGI BIR anda o hedefe ulasan sinyal orani):")
+    print("Bu, senin kullanim seklini (sinyal + kendi analizin + %5-10'da cikis) yansitir.")
+    print("-" * 60)
+    for h in HEDEF_YUZDELER:
+        col = f"hedef_%{h}_ulasti"
+        oran = df[col].mean() * 100
+        print(f"  %{h}'e ulasan sinyal orani: %{oran:.1f}  ({df[col].sum()}/{len(df)} sinyal)")
+
+    print("\nOrtalama MFE (ulasilan en iyi hareket) ve MAE (yolda gorulen en kotu hareket):")
+    print(f"  Ortalama MFE: %{df['mfe_%'].mean():.2f}  |  Medyan MFE: %{df['mfe_%'].median():.2f}")
+    print(f"  Ortalama MAE: %{df['mae_%'].mean():.2f}  |  Medyan MAE: %{df['mae_%'].median():.2f}")
+    print("  (MAE negatif cikmasi normal - 'hedefe varmadan once ne kadar aleyhe gidildi' demek,")
+    print("   stop-loss'unu kac % koyman gerektigini tahmin etmene yardimci olur.)")
+
+    print("\n" + "-" * 60)
+    print("ZAMAN DILIMINE GORE PERFORMANS (fees/slippage haric, basit ortalama, sabit sure sonu):")
     print("-" * 60)
     for label in HORIZONS:
         col = f"getiri_{label}_%"
