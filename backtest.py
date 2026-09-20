@@ -1,19 +1,20 @@
 """
-Backtest Scripti
-=================
-Canli botla (bybit_signal_bot.py) BIREBIR AYNI strateji mantigini gecmis
-veriye uygular: her coin icin tum gecmiste ne zaman LONG/SHORT sinyali
-olustugunu bulur, sonra sinyalden sonraki 1s / 4s / 24s / 3 gun icinde
-fiyatin ne kadar hareket ettigine bakar.
+Backtest - Kalman Trend + QQE Momentum + S/R Bolgesi Stratejisi
+==================================================================
+Canli botla (bybit_signal_bot.py) BIREBIR AYNI mantigi gecmis veriye
+uygular. Her sinyal icin, sonraki 3 gun icinde HERHANGI BIR anda kac %
+lehte hareket gorduğunu (MFE) ve yolda ne kadar aleyhe gidildigini (MAE)
+olcer - "sinyali gorup kendi analizinle girip %5-10'da cikma" kullanim
+seklini yansitir.
 
-ONEMLI KISITLAMA: Tetikleyici (RSI/MACD/hacim/ATR) 15 dakikalik mumlar
-uzerinden calisiyor, Yahoo Finance 15 dakikalik veriyi sadece SON 60 GUN
-icin veriyor. Yani bu backtest sadece son ~60 gunu kapsayabiliyor - uzun
-vadeli (orn. 1 yillik) bir test degil. Trend (1G/4S) hesaplamasi icin
-730 gunluk saatlik veri kullaniliyor, o kisim daha uzun donemi kapsiyor.
+ONEMLI KISITLAMA: S/R bolgeleri, her coin icin TUM 4 saatlik gecmisten
+(730 gun) hesaplanir - yani gelecekteki fiyat hareketleri de bolge
+tespitine katkida bulunmus olabilir (hafif ileriye-bakis / lookahead).
+Canli botta bu sorun yok (o an sadece o ana kadarki veriyi gorur).
+Bu yuzden backtest sonuclari gercek performanstan biraz iyimser olabilir,
+yorumlarken bunu akilda tut.
 
-Sonuc: results/backtest_sonuclari.csv (her sinyalin detayi) ve konsola
-ozet istatistikler yazdirilir.
+Sonuc: results/backtest_sonuclari.csv ve konsola ozet istatistikler.
 """
 
 import yfinance as yf
@@ -49,33 +50,41 @@ TREND_INTERVAL = "1h"
 TRIGGER_PERIOD = "60d"
 TRIGGER_INTERVAL = "15m"
 
-RSI_PERIOD = 14
-RSI_LONG_LEVEL = 40       # (eskisi: 35) - hafif gevsetildi
-RSI_SHORT_LEVEL = 60      # (eskisi: 65)
-MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+QQE_RSI_PERIOD = 14
+QQE_SMOOTHING = 5
+QQE_FACTOR = 4.236
+QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
+
+KALMAN_PROCESS_VAR = 1e-5
+KALMAN_MEASUREMENT_VAR = 1e-2
+KALMAN_SLOPE_LOOKBACK = 5
+
+SR_SWING_ORDER = 3
+SR_CLUSTER_TOLERANCE = 0.015
+SR_MIN_TOUCHES = 2
+SR_STRONG_TOUCHES = 4
+SR_PROXIMITY_PCT = 0.015
+
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.2   # (eskisi: 1.5)
-ATR_PERIOD = 14
-ATR_LOOKBACK = 50
-ATR_MIN_RATIO = 0.5
+VOLUME_SPIKE_MULT = 1.2
 
-EMA_1D = 200
-EMA_4H_FAST = 50
-EMA_4H_SLOW = 200
+PUAN_KALMAN_1G = 3
+PUAN_KALMAN_4S = 3
+PUAN_HACIM = 2
+PUAN_BOLGE_GUC_ZAYIF = 1
+PUAN_BOLGE_GUC_GUCLU = 2
+MAX_PUAN = PUAN_KALMAN_1G + PUAN_KALMAN_4S + PUAN_HACIM + PUAN_BOLGE_GUC_GUCLU
+ESIK_ORTA_GUVEN = 5
+ESIK_YUKSEK_GUVEN = 8
 
-# Sinyal sonrasi kac 15dk'lik mum ileriye bakilacak (1s=4, 4s=16, 24s=96, 3gun=288)
-HORIZONS = {"1s": 4, "4s": 16, "24s": 96, "3gun": 288}
-
-# Hedef yakalama analizi icin: sinyal sonrasi kac 15dk mum ileriye bakilacak
-# (3 gun = 288 mum, kullanicinin bazen birkac gun tuttugunu belirtmesine gore)
-MFE_HORIZON = 288
+MFE_HORIZON = 288  # 3 gun (15dk mum sayisi)
 HEDEF_YUZDELER = [3, 5, 7, 10]
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 
 # ----------------------------------------------------------------------
-# INDIKATORLER (bybit_signal_bot.py ile ayni)
+# INDIKATORLER (canli botla ayni)
 # ----------------------------------------------------------------------
 
 def ema(series, period):
@@ -92,21 +101,108 @@ def rsi(series, period=14):
     return (100 - (100 / (1 + rs))).fillna(50)
 
 
-def macd(series, fast=12, slow=26, signal=9):
-    macd_line = ema(series, fast) - ema(series, slow)
-    signal_line = ema(macd_line, signal)
-    return macd_line, signal_line
+def kalman_smooth(prices, process_var=KALMAN_PROCESS_VAR, measurement_var=KALMAN_MEASUREMENT_VAR):
+    n = len(prices)
+    xhat = np.zeros(n)
+    P = np.zeros(n)
+    xhat[0] = prices[0]
+    P[0] = 1.0
+    for k in range(1, n):
+        P_minus = P[k - 1] + process_var
+        K = P_minus / (P_minus + measurement_var)
+        xhat[k] = xhat[k - 1] + K * (prices[k] - xhat[k - 1])
+        P[k] = (1 - K) * P_minus
+    return xhat
 
 
-def atr(df, period=14):
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+def kalman_trend_series(close: pd.Series, lookback=KALMAN_SLOPE_LOOKBACK):
+    """Her nokta icin (gecmise bakarak, o ana kadarki veriyle) Kalman egimini dondurur."""
+    xhat = kalman_smooth(close.values)
+    xhat_s = pd.Series(xhat, index=close.index)
+    egim = xhat_s - xhat_s.shift(lookback)
+    return egim
+
+
+def compute_qqe(close: pd.Series):
+    rsi_val = rsi(close, QQE_RSI_PERIOD)
+    rsi_ma = ema(rsi_val, QQE_SMOOTHING)
+    atr_rsi = rsi_ma.diff().abs()
+    ma_atr_rsi = atr_rsi.ewm(alpha=1 / QQE_WILDER_PERIOD, adjust=False).mean()
+    dar = ma_atr_rsi.ewm(alpha=1 / QQE_WILDER_PERIOD, adjust=False).mean() * QQE_FACTOR
+
+    rsi_ma_v = rsi_ma.values
+    dar_v = dar.values
+    n = len(close)
+    longband = np.zeros(n)
+    shortband = np.zeros(n)
+    trend = np.zeros(n, dtype=int)
+
+    for i in range(1, n):
+        new_long = rsi_ma_v[i] - dar_v[i]
+        new_short = rsi_ma_v[i] + dar_v[i]
+        if rsi_ma_v[i - 1] > longband[i - 1] and rsi_ma_v[i] > longband[i - 1]:
+            longband[i] = max(new_long, longband[i - 1])
+        else:
+            longband[i] = new_long
+        if rsi_ma_v[i - 1] < shortband[i - 1] and rsi_ma_v[i] < shortband[i - 1]:
+            shortband[i] = min(new_short, shortband[i - 1])
+        else:
+            shortband[i] = new_short
+        if rsi_ma_v[i] > shortband[i - 1]:
+            trend[i] = 1
+        elif rsi_ma_v[i] < longband[i - 1]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i - 1]
+
+    trend_s = pd.Series(trend, index=close.index)
+    bullish_cross = (trend_s == 1) & (trend_s.shift(1) != 1)
+    bearish_cross = (trend_s == -1) & (trend_s.shift(1) != -1)
+    return bullish_cross, bearish_cross
+
+
+def find_sr_zones(df_htf):
+    window = 2 * SR_SWING_ORDER + 1
+    roll_max = df_htf["High"].rolling(window, center=True).max()
+    roll_min = df_htf["Low"].rolling(window, center=True).min()
+    swing_high_mask = df_htf["High"] == roll_max
+    swing_low_mask = df_htf["Low"] == roll_min
+    highs = sorted(df_htf.loc[swing_high_mask, "High"].dropna().tolist())
+    lows = sorted(df_htf.loc[swing_low_mask, "Low"].dropna().tolist())
+
+    def cluster(prices):
+        zones = []
+        group = []
+        for p in prices:
+            if not group or (p - group[-1]) / group[-1] <= SR_CLUSTER_TOLERANCE:
+                group.append(p)
+            else:
+                if len(group) >= SR_MIN_TOUCHES:
+                    zones.append((float(np.mean(group)), len(group)))
+                group = [p]
+        if len(group) >= SR_MIN_TOUCHES:
+            zones.append((float(np.mean(group)), len(group)))
+        return zones
+
+    return cluster(lows), cluster(highs)
+
+
+def zone_below(price, zones, max_pct=SR_PROXIMITY_PCT):
+    cands = [(price - zp, zp, t) for zp, t in zones if zp <= price]
+    if not cands:
+        return None
+    cands.sort()
+    dist, zp, t = cands[0]
+    return (zp, t) if dist / price <= max_pct else None
+
+
+def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
+    cands = [(zp - price, zp, t) for zp, t in zones if zp >= price]
+    if not cands:
+        return None
+    cands.sort()
+    dist, zp, t = cands[0]
+    return (zp, t) if dist / price <= max_pct else None
 
 
 # ----------------------------------------------------------------------
@@ -114,10 +210,6 @@ def atr(df, period=14):
 # ----------------------------------------------------------------------
 
 def fetch_history(base, period, interval, retries=4):
-    """
-    Veriyi ceker. Yahoo Finance cok sik istek gelince (rate limit) bos cevap
-    dondurdugu icin, basarisiz olursa gittikce artan surelerle tekrar dener.
-    """
     ticker = f"{YF_TICKER_OVERRIDES.get(base, base)}{YF_SUFFIX}"
     df = None
     for attempt in range(retries):
@@ -126,12 +218,10 @@ def fetch_history(base, period, interval, retries=4):
         except Exception as e:
             print(f"  UYARI: {ticker} ({interval}) deneme {attempt+1} hata: {e}", file=sys.stderr)
             df = None
-
         if df is not None and not df.empty:
             break
-
         if attempt < retries - 1:
-            wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+            wait = 5 * (attempt + 1)
             print(f"  {ticker} ({interval}) bos dondu, {wait}sn bekleyip tekrar denenecek...")
             time.sleep(wait)
 
@@ -152,168 +242,125 @@ def resample(df_1h, rule):
     return out.reset_index()
 
 
-# GUVEN SKORU AGIRLIKLARI (toplam 10 puan) - canli botla birebir ayni
-PUAN_TREND_1G = 2
-PUAN_TREND_4S = 2
-PUAN_RSI_4S_YON = 1
-PUAN_RSI_KESISIM = 2
-PUAN_MACD_KESISIM = 2
-PUAN_HACIM = 1
-MAX_PUAN = PUAN_TREND_1G + PUAN_TREND_4S + PUAN_RSI_4S_YON + PUAN_RSI_KESISIM + PUAN_MACD_KESISIM + PUAN_HACIM
-ESIK_ORTA_GUVEN = 5
-ESIK_YUKSEK_GUVEN = 8
-
-
 # ----------------------------------------------------------------------
-# TUM GECMIS ICIN SINYAL TARAMASI (vektorel)
+# TUM GECMIS ICIN TARAMA
 # ----------------------------------------------------------------------
 
 def backtest_symbol(base: str):
-    """
-    Geri donus: (sinyaller_df, veri_tamam_mi)
-    veri_tamam_mi False ise Yahoo veri vermemis demektir (sinyal yoklugundan farkli).
-    """
     df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
-    time.sleep(2)  # iki istek arasi kisa bekleme
+    time.sleep(2)
     df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
 
     if df_trend_1h is None or df_trig is None:
         return pd.DataFrame(), False
-    if len(df_trend_1h) < EMA_1D * 24 or len(df_trig) < ATR_LOOKBACK + RSI_PERIOD + 10:
+    if len(df_trend_1h) < 200 * 24 or len(df_trig) < 300:
         return pd.DataFrame(), False
 
     df_4h = resample(df_trend_1h, "4h")
     df_1d = resample(df_trend_1h, "1D")
-    if len(df_1d) < EMA_1D or len(df_4h) < EMA_4H_SLOW:
+    if len(df_1d) < 30 or len(df_4h) < 60:
         return pd.DataFrame(), False
 
+    # Kalman egimleri - HER NOKTA icin (o ana kadarki veriyle) hesaplanir
+    egim_1d_series = kalman_trend_series(df_1d["Close"])
+    egim_4h_series = kalman_trend_series(df_4h["Close"])
     df_1d = df_1d.copy()
-    df_1d["ema200"] = ema(df_1d["Close"], EMA_1D)
-    df_1d["trend_up_1d"] = df_1d["Close"] > df_1d["ema200"]
-    df_1d["trend_down_1d"] = df_1d["Close"] < df_1d["ema200"]
-
     df_4h = df_4h.copy()
-    df_4h["ema50"] = ema(df_4h["Close"], EMA_4H_FAST)
-    df_4h["ema200"] = ema(df_4h["Close"], EMA_4H_SLOW)
-    df_4h["trend_up_4h"] = (df_4h["ema50"] > df_4h["ema200"]) & (df_4h["Close"] > df_4h["ema50"])
-    df_4h["trend_down_4h"] = (df_4h["ema50"] < df_4h["ema200"]) & (df_4h["Close"] < df_4h["ema50"])
+    df_1d["kalman_up"] = egim_1d_series > 0
+    df_1d["kalman_down"] = egim_1d_series < 0
+    df_4h["kalman_up"] = egim_4h_series > 0
+    df_4h["kalman_down"] = egim_4h_series < 0
 
-    # Trigger zaman damgalarina, o ana kadar bilinen en son 1G/4S trendini esle
+    # S/R bolgeleri - NOT: tum 4S gecmisinden (bkz. dosya basindaki kisitlama notu)
+    destek_bolgeleri, direnc_bolgeleri = find_sr_zones(df_4h)
+
     trig = df_trig.sort_values("dt").reset_index(drop=True)
-    trig = pd.merge_asof(trig, df_1d[["dt", "trend_up_1d", "trend_down_1d"]], on="dt", direction="backward")
-    trig = pd.merge_asof(trig, df_4h[["dt", "trend_up_4h", "trend_down_4h"]], on="dt", direction="backward")
-    trig["trend_up_1d"] = trig["trend_up_1d"].fillna(False)
-    trig["trend_down_1d"] = trig["trend_down_1d"].fillna(False)
-    trig["trend_up_4h"] = trig["trend_up_4h"].fillna(False)
-    trig["trend_down_4h"] = trig["trend_down_4h"].fillna(False)
+    trig = pd.merge_asof(trig, df_1d[["dt", "kalman_up", "kalman_down"]].rename(
+        columns={"kalman_up": "kalman_up_1d", "kalman_down": "kalman_down_1d"}), on="dt", direction="backward")
+    trig = pd.merge_asof(trig, df_4h[["dt", "kalman_up", "kalman_down"]].rename(
+        columns={"kalman_up": "kalman_up_4h", "kalman_down": "kalman_down_4h"}), on="dt", direction="backward")
+    trig["kalman_up_1d"] = trig["kalman_up_1d"].fillna(False)
+    trig["kalman_down_1d"] = trig["kalman_down_1d"].fillna(False)
+    trig["kalman_up_4h"] = trig["kalman_up_4h"].fillna(False)
+    trig["kalman_down_4h"] = trig["kalman_down_4h"].fillna(False)
 
-    # 4 saatlik RSI de trigger zaman damgalarina eslenir
-    df_4h = df_4h.copy()
-    df_4h["rsi_4h"] = rsi(df_4h["Close"], RSI_PERIOD)
-    trig = pd.merge_asof(trig, df_4h[["dt", "rsi_4h"]], on="dt", direction="backward")
-    rsi_4h_bullish = trig["rsi_4h"] > 50
-    rsi_4h_bearish = trig["rsi_4h"] < 50
+    qqe_bull, qqe_bear = compute_qqe(trig["Close"])
+    vol_ma = trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
+    volume_spike = (vol_ma > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * vol_ma)
 
-    trig["rsi"] = rsi(trig["Close"], RSI_PERIOD)
-    macd_line, signal_line = macd(trig["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    trig["macd"] = macd_line
-    trig["macd_signal"] = signal_line
-    trig["vol_ma"] = trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
-    trig["atr"] = atr(trig, ATR_PERIOD)
-    trig["atr_pct"] = trig["atr"] / trig["Close"]
-    trig["atr_pct_avg"] = trig["atr_pct"].rolling(ATR_LOOKBACK).mean()
-
-    rsi_prev = trig["rsi"].shift(1)
-    macd_prev = trig["macd"].shift(1)
-    sig_prev = trig["macd_signal"].shift(1)
-
-    rsi_cross_up = (rsi_prev < RSI_LONG_LEVEL) & (trig["rsi"] >= RSI_LONG_LEVEL)
-    rsi_cross_down = (rsi_prev > RSI_SHORT_LEVEL) & (trig["rsi"] <= RSI_SHORT_LEVEL)
-    macd_cross_up = (macd_prev < sig_prev) & (trig["macd"] >= trig["macd_signal"])
-    macd_cross_down = (macd_prev > sig_prev) & (trig["macd"] <= trig["macd_signal"])
-    volume_spike = (trig["vol_ma"] > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * trig["vol_ma"])
-    atr_ok = trig["atr_pct_avg"].notna() & (trig["atr_pct"] >= ATR_MIN_RATIO * trig["atr_pct_avg"])
-
-    # Kapi: RSI VE MACD kesisiminin AYNI YONDE, AYNI ANDA olmasi sart
-    long_kapi = rsi_cross_up & macd_cross_up
-    short_kapi = rsi_cross_down & macd_cross_down
-    has_trigger = long_kapi | short_kapi
-
-    long_puan = long_kapi.astype(int) * (
-        trig["trend_up_1d"].astype(int) * PUAN_TREND_1G
-        + trig["trend_up_4h"].astype(int) * PUAN_TREND_4S
-        + rsi_4h_bullish.astype(int) * PUAN_RSI_4S_YON
-        + (PUAN_RSI_KESISIM + PUAN_MACD_KESISIM)
-        + volume_spike.astype(int) * PUAN_HACIM
-    )
-    short_puan = short_kapi.astype(int) * (
-        trig["trend_down_1d"].astype(int) * PUAN_TREND_1G
-        + trig["trend_down_4h"].astype(int) * PUAN_TREND_4S
-        + rsi_4h_bearish.astype(int) * PUAN_RSI_4S_YON
-        + (PUAN_RSI_KESISIM + PUAN_MACD_KESISIM)
-        + volume_spike.astype(int) * PUAN_HACIM
-    )
-
-    direction = np.where(long_puan >= short_puan, "LONG", "SHORT")
-    puan = np.where(long_puan >= short_puan, long_puan, short_puan)
-    guven = np.where(puan >= ESIK_YUKSEK_GUVEN, "YUKSEK", "ORTA")
-
-    sinyal_var = atr_ok & has_trigger & (puan >= ESIK_ORTA_GUVEN)
-
-    trig["direction"] = np.where(sinyal_var, direction, None)
-    trig["puan"] = puan
-    trig["guven"] = np.where(sinyal_var, guven, None)
-    signals = trig[trig["direction"].notna()].copy()
-    signals["symbol"] = base
-
-    # Ileriye donuk getiriler (sabit sure sonundaki nokta getirisi)
     closes = trig["Close"].values
     n = len(trig)
-    for label, steps in HORIZONS.items():
-        future_idx = signals.index + steps
-        valid = future_idx < n
-        entry_prices = signals["Close"].values
-        fut_prices = np.where(valid, closes[np.clip(future_idx, 0, n - 1)], np.nan)
-        ret_long = (fut_prices / entry_prices - 1) * 100
-        ret = np.where(signals["direction"].values == "LONG", ret_long, -ret_long)
-        signals[f"getiri_{label}_%"] = np.round(ret, 2)
 
-    # MFE/MAE: sinyal sonrasi MFE_HORIZON mum icinde, herhangi bir anda
-    # ulasilan EN IYI (lehte) ve EN KOTU (aleyhte) hareket - "sinyalden sonra
-    # hedefe ulastim mi, yoksa hic ulasmadan mi kaldi" sorusuna cevap verir.
-    mfe_list, mae_list = [], []
-    hedef_kolonlari = {h: [] for h in HEDEF_YUZDELER}
-    for idx, row in signals.iterrows():
-        start = idx + 1
-        end = min(idx + 1 + MFE_HORIZON, n)
+    kayitlar = []
+    for i in range(n):
+        if not (bool(qqe_bull.iloc[i]) or bool(qqe_bear.iloc[i])):
+            continue
+        price_now = closes[i]
+
+        long_kapi = bool(qqe_bull.iloc[i]) and (zone_below(price_now, destek_bolgeleri) is not None)
+        short_kapi = bool(qqe_bear.iloc[i]) and (zone_above(price_now, direnc_bolgeleri) is not None)
+        if not (long_kapi or short_kapi):
+            continue
+
+        long_puan = short_puan = 0
+        long_bolge = short_bolge = None
+
+        if long_kapi:
+            long_bolge = zone_below(price_now, destek_bolgeleri)
+            if trig["kalman_up_1d"].iloc[i]:
+                long_puan += PUAN_KALMAN_1G
+            if trig["kalman_up_4h"].iloc[i]:
+                long_puan += PUAN_KALMAN_4S
+            if volume_spike.iloc[i]:
+                long_puan += PUAN_HACIM
+            long_puan += PUAN_BOLGE_GUC_GUCLU if long_bolge[1] >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
+
+        if short_kapi:
+            short_bolge = zone_above(price_now, direnc_bolgeleri)
+            if trig["kalman_down_1d"].iloc[i]:
+                short_puan += PUAN_KALMAN_1G
+            if trig["kalman_down_4h"].iloc[i]:
+                short_puan += PUAN_KALMAN_4S
+            if volume_spike.iloc[i]:
+                short_puan += PUAN_HACIM
+            short_puan += PUAN_BOLGE_GUC_GUCLU if short_bolge[1] >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
+
+        if long_puan >= short_puan and long_kapi:
+            direction, puan = "LONG", long_puan
+        elif short_kapi:
+            direction, puan = "SHORT", short_puan
+        else:
+            continue
+
+        if puan < ESIK_ORTA_GUVEN:
+            continue
+
+        guven = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
+
+        # MFE/MAE
+        start, end = i + 1, min(i + 1 + MFE_HORIZON, n)
         if start >= end:
-            mfe_list.append(np.nan)
-            mae_list.append(np.nan)
-            for h in HEDEF_YUZDELER:
-                hedef_kolonlari[h].append(False)
             continue
         window = closes[start:end]
-        entry = row["Close"]
-        if row["direction"] == "LONG":
-            pct_path = (window / entry - 1) * 100
+        if direction == "LONG":
+            pct_path = (window / price_now - 1) * 100
         else:
-            pct_path = (entry - window) / entry * 100
+            pct_path = (price_now - window) / price_now * 100
         mfe = float(np.max(pct_path))
         mae = float(np.min(pct_path))
-        mfe_list.append(round(mfe, 2))
-        mae_list.append(round(mae, 2))
+
+        kayit = {
+            "symbol": base, "dt": trig["dt"].iloc[i], "direction": direction,
+            "puan": puan, "guven": guven, "Close": price_now,
+            "mfe_%": round(mfe, 2), "mae_%": round(mae, 2),
+        }
         for h in HEDEF_YUZDELER:
-            hedef_kolonlari[h].append(bool(mfe >= h))
+            kayit[f"hedef_%{h}_ulasti"] = mfe >= h
+        kayitlar.append(kayit)
 
-    signals["mfe_%"] = mfe_list       # sinyalden sonra ulasilan en iyi hareket
-    signals["mae_%"] = mae_list       # sinyalden sonra ulasilan en kotu hareket (once bu gorulebilir)
-    for h in HEDEF_YUZDELER:
-        signals[f"hedef_%{h}_ulasti"] = hedef_kolonlari[h]
-
-    kolonlar = (["symbol", "dt", "direction", "puan", "guven", "Close", "mfe_%", "mae_%"]
-                + [f"getiri_{h}_%" for h in HORIZONS]
-                + [f"hedef_%{h}_ulasti" for h in HEDEF_YUZDELER])
-    return signals[kolonlar], True
+    if not kayitlar:
+        return pd.DataFrame(), True
+    return pd.DataFrame(kayitlar), True
 
 
 # ----------------------------------------------------------------------
@@ -323,8 +370,7 @@ def backtest_symbol(base: str):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     all_signals = []
-    basarili_coinler = []
-    veri_alinamayan = []
+    basarili_coinler, veri_alinamayan = [], []
 
     for idx, base in enumerate(CRYPTO_SYMBOLS):
         print(f"\n[{idx+1}/{len(CRYPTO_SYMBOLS)}] Taraniyor: {base}...")
@@ -336,7 +382,7 @@ def main():
             continue
 
         if not veri_tamam:
-            print(f"  -> VERI ALINAMADI (Yahoo cevap vermedi veya yetersiz gecmis)")
+            print(f"  -> VERI ALINAMADI")
             veri_alinamayan.append(base)
         else:
             basarili_coinler.append(base)
@@ -346,7 +392,6 @@ def main():
             else:
                 print(f"  -> veri tamam, ama hic sinyal olusmamis")
 
-        # Yahoo'yu yormamak icin coinler arasi bekleme
         if idx < len(CRYPTO_SYMBOLS) - 1:
             time.sleep(3)
 
@@ -357,7 +402,7 @@ def main():
     print("=" * 60)
 
     if not all_signals:
-        print("\nHICBIR SINYAL BULUNAMADI. Son 60 gunde strateji hicbir coin icin tetiklenmemis.")
+        print("\nHICBIR SINYAL BULUNAMADI.")
         return
 
     df = pd.concat(all_signals, ignore_index=True)
@@ -375,62 +420,30 @@ def main():
     print(df["symbol"].value_counts().to_string())
 
     print("\n" + "-" * 60)
-    print("GUVEN SEVIYESINE GORE PERFORMANS (24s getiri):")
-    print("-" * 60)
-    for guven_lvl in ["YUKSEK", "ORTA"]:
-        alt = df[df["guven"] == guven_lvl]
-        valid = alt["getiri_24s_%"].dropna()
-        if len(valid) == 0:
-            print(f"{guven_lvl}: sinyal yok")
-            continue
-        win_rate = (valid > 0).mean() * 100
-        print(f"{guven_lvl}: {len(alt)} sinyal | Kazanma orani: %{win_rate:.1f} | "
-              f"Ortalama getiri: %{valid.mean():.2f}")
-        for h in [5, 10]:
-            col = f"hedef_%{h}_ulasti"
-            oran = alt[col].mean() * 100
-            print(f"    -> %{h} hedefe ulasan oran: %{oran:.1f}")
-
-    print("\n" + "-" * 60)
-    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde, HERHANGI BIR anda o hedefe ulasan sinyal orani):")
-    print("Bu, senin kullanim seklini (sinyal + kendi analizin + %5-10'da cikis) yansitir.")
+    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde, HERHANGI BIR anda):")
     print("-" * 60)
     for h in HEDEF_YUZDELER:
         col = f"hedef_%{h}_ulasti"
         oran = df[col].mean() * 100
         print(f"  %{h}'e ulasan sinyal orani: %{oran:.1f}  ({df[col].sum()}/{len(df)} sinyal)")
 
-    print("\nOrtalama MFE (ulasilan en iyi hareket) ve MAE (yolda gorulen en kotu hareket):")
-    print(f"  Ortalama MFE: %{df['mfe_%'].mean():.2f}  |  Medyan MFE: %{df['mfe_%'].median():.2f}")
-    print(f"  Ortalama MAE: %{df['mae_%'].mean():.2f}  |  Medyan MAE: %{df['mae_%'].median():.2f}")
-    print("  (MAE negatif cikmasi normal - 'hedefe varmadan once ne kadar aleyhe gidildi' demek,")
-    print("   stop-loss'unu kac % koyman gerektigini tahmin etmene yardimci olur.)")
+    print(f"\nOrtalama MFE: %{df['mfe_%'].mean():.2f}  |  Medyan MFE: %{df['mfe_%'].median():.2f}")
+    print(f"Ortalama MAE: %{df['mae_%'].mean():.2f}  |  Medyan MAE: %{df['mae_%'].median():.2f}")
 
     print("\n" + "-" * 60)
-    print("ZAMAN DILIMINE GORE PERFORMANS (fees/slippage haric, basit ortalama, sabit sure sonu):")
+    print("GUVEN SEVIYESINE GORE HEDEF YAKALAMA:")
     print("-" * 60)
-    for label in HORIZONS:
-        col = f"getiri_{label}_%"
-        valid = df[col].dropna()
-        if len(valid) == 0:
+    for guven_lvl in ["YUKSEK", "ORTA"]:
+        alt = df[df["guven"] == guven_lvl]
+        if alt.empty:
+            print(f"{guven_lvl}: sinyal yok")
             continue
-        win_rate = (valid > 0).mean() * 100
-        avg_ret = valid.mean()
-        print(f"{label:>5}: {len(valid)} sinyal degerlendirildi | "
-              f"Kazanma orani: %{win_rate:.1f} | Ortalama getiri: %{avg_ret:.2f}")
-
-    print("\n" + "-" * 60)
-    print("EN IYI 5 VE EN KOTU 5 SINYAL (24s getiriye gore):")
-    print("-" * 60)
-    valid_24 = df.dropna(subset=["getiri_24s_%"]).sort_values("getiri_24s_%")
-    if not valid_24.empty:
-        print("\nEn kotu 5:")
-        print(valid_24.head(5)[["symbol", "dt", "direction", "getiri_24s_%"]].to_string(index=False))
-        print("\nEn iyi 5:")
-        print(valid_24.tail(5)[["symbol", "dt", "direction", "getiri_24s_%"]].to_string(index=False))
+        print(f"{guven_lvl}: {len(alt)} sinyal")
+        for h in [5, 10]:
+            col = f"hedef_%{h}_ulasti"
+            print(f"    -> %{h} hedefe ulasan oran: %{alt[col].mean()*100:.1f}")
 
     print(f"\nTum detaylar kaydedildi: {out_path}")
-    print("Bu dosyayi GitHub Actions calismasinin 'Artifacts' bolumunden indirebilirsin.")
 
 
 if __name__ == "__main__":
