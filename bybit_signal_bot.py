@@ -1,38 +1,27 @@
 """
-Adaptif Kripto Sinyal Botu - Kalman Trend + QQE Momentum + S/R Bolgesi
-========================================================================
-Veri kaynagi: Yahoo Finance (Binance/Bybit'in genel API'leri bulut IP'lerini
-engelledigi icin). Sen istedigin borsada - orn. Bybit'te - islem acarsin.
+Adaptif Kripto Sinyal Botu - v3 (Veriye Dayali Iyilestirme)
+==============================================================
+Onceki backtest bulgusu: "Yuksek Guven" (trend uyumu yuksek) sinyaller,
+"Orta Guven"den DAHA KOTU performans gosterdi - yani buyuk zaman dilimi
+trend uyumu bu stratejide gercek bir avantaj katmiyor (bazen tam tersi).
 
-STRATEJI MANTIGI (kullanicinin talebi uzerine tasarlandi):
+BU YUZDEN: Trend (Kalman) puanlamadan tamamen CIKARILDI. Bunun yerine,
+gercekten ayirt edici oldugu gorulen 4 faktore agirlik verildi:
 
-1) ZORUNLU ON KOSUL (ikisi de saglanmali, yoksa sinyal aranmaz bile):
-   a) QQE Momentum donusu (15 dakikalik veride) - RSI'nin duz seviye
-      kesmesinden cok daha az yanilti veren, kendi volatilitesine gore
-      genisleyen/daralan bir "trailing band" ile calisan momentum donus
-      tespiti (QQE = Quantitative Qualitative Estimation).
-   b) Fiyatin, gecmis 4 saatlik veriden tespit edilen GUCLU bir Destek
-      (LONG icin) veya Direnc (SHORT icin) bolgesine yakin olmasi (bounce/
-      reddedilme kurulumu ariyoruz, rastgele bir noktada degil).
+ZORUNLU ON KOSUL (ikisi de sart):
+  a) QQE Momentum donusu (15dk)
+  b) Fiyatin bir Destek/Direnc bolgesine yakin olmasi (4S veriden)
 
-2) CONVICTION (GUVEN) PUANI (10 uzerinden, on kosul saglaninca hesaplanir):
-   - Kalman Trend Filtresi 1G yonu ile uyum: 3 puan
-   - Kalman Trend Filtresi 4S yonu ile uyum: 3 puan
-   - Hacim teyidi (20 ort. 1.2 kati): 2 puan
-   - Destek/Direnc bolgesinin gucu (kac kez test edilmis): 1-2 puan
+GUVEN PUANI (10 uzerinden, sadece ON KOSUL saglaninca hesaplanir):
+  - Bolge GUCU (kac kez test edilmis): maks 3 puan
+  - Bolgeye YAKINLIK (ne kadar yakin, ne kadar keskin bir reaksiyon
+    bolgesi): maks 3 puan
+  - QQE momentum GUCU (RSI'nin kendi bandini ne kadar asarak kestigi -
+    zayif/gucuk kesisim ayrimi): maks 2 puan
+  - Hacim teyidi: maks 2 puan
 
-   Kalman filtresi, klasik hareketli ortalamalardan farkli olarak
-   fiyatin gurultusune gore kendini otomatik ayarlayan (adaptif) bir
-   tahmin filtresidir - ani gurultuye asiri tepki vermez, gercek trend
-   donuslerini daha az gecikmeyle yakalar.
+Guven esikleri: 8-10 = YUKSEK, 5-7 = ORTA, 5 alti = sinyal yok.
 
-3) HEDEF (TP) ONERISI: Sinyal yonunun tersindeki en yakin S/R bolgesi,
-   olasi kar-al hedefi olarak mail icinde onerilir (kesin tavsiye degil,
-   referans noktasi).
-
-Guven esikleri: 8-10 puan = YUKSEK, 5-7 puan = ORTA, 5 alti = sinyal yok.
-
-Ayni sinyali tekrar tekrar mail atmamak icin state.json'da hafiza tutar.
 Calistirma: GitHub Actions ile her 15 dakikada bir.
 Gerekli ortam degiskenleri (GitHub Secrets):
   GMAIL_ADDRESS, GMAIL_APP_PASSWORD, TO_EMAIL
@@ -64,45 +53,31 @@ CRYPTO_SYMBOLS = [
 
 YF_SUFFIX = "-USD"
 YF_TICKER_OVERRIDES = {
-    "SUI": "SUI20947",
-    "HYPE": "HYPE32196",
-    "APT": "APT21794",
-    "TAO": "TAO22974",
+    "SUI": "SUI20947", "HYPE": "HYPE32196", "APT": "APT21794", "TAO": "TAO22974",
 }
-TREND_PERIOD = "730d"
+TREND_PERIOD = "730d"       # 4S S/R bolgelerini olusturmak icin gerekli
 TREND_INTERVAL = "1h"
 TRIGGER_PERIOD = "60d"
 TRIGGER_INTERVAL = "15m"
 
-# --- QQE (momentum donusu) ayarlari ---
+# --- QQE (momentum donusu) ---
 QQE_RSI_PERIOD = 14
 QQE_SMOOTHING = 5
 QQE_FACTOR = 4.236
-QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1  # 27
+QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
-# --- Kalman filtresi ayarlari (adaptif trend) ---
-KALMAN_PROCESS_VAR = 1e-5
-KALMAN_MEASUREMENT_VAR = 1e-2
-KALMAN_SLOPE_LOOKBACK = 5
-
-# --- Destek/Direnc bolgesi ayarlari ---
+# --- Destek/Direnc bolgesi ---
 SR_SWING_ORDER = 3
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 2
-SR_STRONG_TOUCHES = 4
 SR_PROXIMITY_PCT = 0.015
 
 # --- Hacim ---
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.2
 
-# --- Guven puanlama agirliklari (toplam 10) ---
-PUAN_KALMAN_1G = 3
-PUAN_KALMAN_4S = 3
-PUAN_HACIM = 2
-PUAN_BOLGE_GUC_ZAYIF = 1
-PUAN_BOLGE_GUC_GUCLU = 2
-MAX_PUAN = PUAN_KALMAN_1G + PUAN_KALMAN_4S + PUAN_HACIM + PUAN_BOLGE_GUC_GUCLU
+# --- Guven puanlama esikleri ---
+MAX_PUAN = 10
 ESIK_ORTA_GUVEN = 5
 ESIK_YUKSEK_GUVEN = 8
 
@@ -129,37 +104,15 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 # ----------------------------------------------------------------------
-# KALMAN TREND FILTRESI
-# ----------------------------------------------------------------------
-
-def kalman_smooth(prices: np.ndarray, process_var=KALMAN_PROCESS_VAR,
-                   measurement_var=KALMAN_MEASUREMENT_VAR) -> np.ndarray:
-    n = len(prices)
-    xhat = np.zeros(n)
-    P = np.zeros(n)
-    xhat[0] = prices[0]
-    P[0] = 1.0
-    for k in range(1, n):
-        P_minus = P[k - 1] + process_var
-        K = P_minus / (P_minus + measurement_var)
-        xhat[k] = xhat[k - 1] + K * (prices[k] - xhat[k - 1])
-        P[k] = (1 - K) * P_minus
-    return xhat
-
-
-def kalman_trend_direction(close: pd.Series, lookback=KALMAN_SLOPE_LOOKBACK):
-    xhat = kalman_smooth(close.values)
-    if len(xhat) <= lookback:
-        return xhat, 0.0
-    egim = xhat[-1] - xhat[-1 - lookback]
-    return xhat, egim
-
-
-# ----------------------------------------------------------------------
-# QQE MOMENTUM DONUSU
+# QQE MOMENTUM DONUSU (+ kesisim GUCU olcumu)
 # ----------------------------------------------------------------------
 
 def compute_qqe(close: pd.Series):
+    """
+    Doner: bullish_cross, bearish_cross (bool serileri) ve
+    cross_strength (kesisim anindaki RSI'nin bandi ne kadar astigini,
+    bandin genisligine oranla olcen - 0'dan yukari, buyuk = guclu donus).
+    """
     rsi_val = rsi(close, QQE_RSI_PERIOD)
     rsi_ma = ema(rsi_val, QQE_SMOOTHING)
     atr_rsi = rsi_ma.diff().abs()
@@ -176,17 +129,14 @@ def compute_qqe(close: pd.Series):
     for i in range(1, n):
         new_long = rsi_ma_v[i] - dar_v[i]
         new_short = rsi_ma_v[i] + dar_v[i]
-
         if rsi_ma_v[i - 1] > longband[i - 1] and rsi_ma_v[i] > longband[i - 1]:
             longband[i] = max(new_long, longband[i - 1])
         else:
             longband[i] = new_long
-
         if rsi_ma_v[i - 1] < shortband[i - 1] and rsi_ma_v[i] < shortband[i - 1]:
             shortband[i] = min(new_short, shortband[i - 1])
         else:
             shortband[i] = new_short
-
         if rsi_ma_v[i] > shortband[i - 1]:
             trend[i] = 1
         elif rsi_ma_v[i] < longband[i - 1]:
@@ -197,7 +147,18 @@ def compute_qqe(close: pd.Series):
     trend_s = pd.Series(trend, index=close.index)
     bullish_cross = (trend_s == 1) & (trend_s.shift(1) != 1)
     bearish_cross = (trend_s == -1) & (trend_s.shift(1) != -1)
-    return bullish_cross, bearish_cross
+
+    # Kesisim gucu: RSI'nin, kesilen bandin ne kadar UZAGINA gectigi,
+    # bandin genisligine (dar) oranla - buyuk oran = guclu/net donus
+    shortband_prev = pd.Series(shortband, index=close.index).shift(1)
+    longband_prev = pd.Series(longband, index=close.index).shift(1)
+    dar_safe = dar.replace(0, np.nan)
+    bull_strength = ((rsi_ma - shortband_prev) / dar_safe).clip(lower=0)
+    bear_strength = ((longband_prev - rsi_ma) / dar_safe).clip(lower=0)
+    cross_strength = np.where(bullish_cross, bull_strength, np.where(bearish_cross, bear_strength, 0.0))
+    cross_strength = pd.Series(cross_strength, index=close.index).fillna(0.0)
+
+    return bullish_cross, bearish_cross, cross_strength
 
 
 # ----------------------------------------------------------------------
@@ -236,7 +197,7 @@ def zone_below(price, zones, max_pct=SR_PROXIMITY_PCT):
         return None
     cands.sort()
     dist, zp, t = cands[0]
-    return (zp, t) if dist / price <= max_pct else None
+    return (zp, t, dist / price) if dist / price <= max_pct else None
 
 
 def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
@@ -245,7 +206,7 @@ def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
         return None
     cands.sort()
     dist, zp, t = cands[0]
-    return (zp, t) if dist / price <= max_pct else None
+    return (zp, t, dist / price) if dist / price <= max_pct else None
 
 
 def nearest_above_any(price, zones):
@@ -262,6 +223,38 @@ def nearest_below_any(price, zones):
         return None
     cands.sort()
     return cands[0][1], cands[0][2]
+
+
+# ----------------------------------------------------------------------
+# PUANLAMA YARDIMCILARI (veriye dayali: bolge gucu + yakinlik + momentum + hacim)
+# ----------------------------------------------------------------------
+
+def puan_bolge_guc(touches: int) -> int:
+    if touches >= 6:
+        return 3
+    if touches >= 4:
+        return 2
+    return 1  # min 2 dokunma zaten gate icin sart
+
+
+def puan_yakinlik(dist_pct: float) -> int:
+    if dist_pct <= 0.005:
+        return 3
+    if dist_pct <= 0.010:
+        return 2
+    return 1
+
+
+def puan_momentum(strength: float) -> int:
+    if strength >= 0.5:
+        return 2
+    if strength >= 0.15:
+        return 1
+    return 0
+
+
+def puan_hacim(spike: bool) -> int:
+    return 2 if spike else 0
 
 
 # ----------------------------------------------------------------------
@@ -309,14 +302,8 @@ def evaluate_symbol(base: str) -> dict | None:
         return None
 
     df_4h = resample(df_trend_1h, "4h")
-    df_1d = resample(df_trend_1h, "1D")
-    if len(df_1d) < 30 or len(df_4h) < 60:
+    if len(df_4h) < 60:
         return None
-
-    _, egim_1d = kalman_trend_direction(df_1d["Close"])
-    _, egim_4h = kalman_trend_direction(df_4h["Close"])
-    kalman_up_1d, kalman_down_1d = egim_1d > 0, egim_1d < 0
-    kalman_up_4h, kalman_down_4h = egim_4h > 0, egim_4h < 0
 
     destek_bolgeleri, direnc_bolgeleri = find_sr_zones(df_4h)
 
@@ -324,53 +311,39 @@ def evaluate_symbol(base: str) -> dict | None:
     if df_trig is None or len(df_trig) < 100:
         return None
 
-    qqe_bull, qqe_bear = compute_qqe(df_trig["Close"])
+    qqe_bull, qqe_bear, qqe_strength = compute_qqe(df_trig["Close"])
     vol_ma = df_trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
 
     i = len(df_trig) - 1
     price_now = float(df_trig["Close"].iloc[i])
     qqe_bull_now = bool(qqe_bull.iloc[i])
     qqe_bear_now = bool(qqe_bear.iloc[i])
+    strength_now = float(qqe_strength.iloc[i])
     vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
     volume_spike = bool(vol_ma_now > 0 and vol_now >= VOLUME_SPIKE_MULT * vol_ma_now)
 
-    long_kapi = qqe_bull_now and (zone_below(price_now, destek_bolgeleri) is not None)
-    short_kapi = qqe_bear_now and (zone_above(price_now, direnc_bolgeleri) is not None)
+    long_zone = zone_below(price_now, destek_bolgeleri) if qqe_bull_now else None
+    short_zone = zone_above(price_now, direnc_bolgeleri) if qqe_bear_now else None
 
-    if not (long_kapi or short_kapi):
+    if long_zone is None and short_zone is None:
         return None
 
-    long_puan, short_puan = 0, 0
-    long_bolge, short_bolge = None, None
+    long_puan = short_puan = 0
+    if long_zone is not None:
+        _, touches, dist_pct = long_zone
+        long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                     + puan_momentum(strength_now) + puan_hacim(volume_spike))
+    if short_zone is not None:
+        _, touches, dist_pct = short_zone
+        short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                      + puan_momentum(strength_now) + puan_hacim(volume_spike))
 
-    if long_kapi:
-        long_bolge = zone_below(price_now, destek_bolgeleri)
-        if kalman_up_1d:
-            long_puan += PUAN_KALMAN_1G
-        if kalman_up_4h:
-            long_puan += PUAN_KALMAN_4S
-        if volume_spike:
-            long_puan += PUAN_HACIM
-        touches = long_bolge[1]
-        long_puan += PUAN_BOLGE_GUC_GUCLU if touches >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
-
-    if short_kapi:
-        short_bolge = zone_above(price_now, direnc_bolgeleri)
-        if kalman_down_1d:
-            short_puan += PUAN_KALMAN_1G
-        if kalman_down_4h:
-            short_puan += PUAN_KALMAN_4S
-        if volume_spike:
-            short_puan += PUAN_HACIM
-        touches = short_bolge[1]
-        short_puan += PUAN_BOLGE_GUC_GUCLU if touches >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
-
-    if long_puan >= short_puan and long_kapi:
-        direction, puan, bolge = "LONG", long_puan, long_bolge
+    if long_zone is not None and long_puan >= short_puan:
+        direction, puan, bolge = "LONG", long_puan, long_zone
         tp_hedef = nearest_above_any(price_now, direnc_bolgeleri)
-    elif short_kapi:
-        direction, puan, bolge = "SHORT", short_puan, short_bolge
+    elif short_zone is not None:
+        direction, puan, bolge = "SHORT", short_puan, short_zone
         tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
     else:
         return None
@@ -390,6 +363,8 @@ def evaluate_symbol(base: str) -> dict | None:
         "price": price_now,
         "bolge_fiyat": bolge[0],
         "bolge_dokunma": bolge[1],
+        "bolge_uzaklik_%": round(bolge[2] * 100, 2),
+        "momentum_gucu": round(strength_now, 2),
         "tp_hedef": tp_hedef[0] if tp_hedef else None,
         "volume_ratio": round(float(vol_now / vol_ma_now), 2) if vol_ma_now else None,
     }
@@ -442,11 +417,12 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
         f"Mum kapanis zamani (TR): {dt_tr.strftime('%d.%m.%Y %H:%M')}\n"
         f"Fiyat: {sig['price']}\n"
         f"Yakin {'Destek' if sig['direction']=='LONG' else 'Direnc'} bolgesi: {sig['bolge_fiyat']} "
-        f"({sig['bolge_dokunma']} kez test edilmis)\n"
+        f"({sig['bolge_dokunma']} kez test edilmis, %{sig['bolge_uzaklik_%']} uzaklikta)\n"
         f"{tp_satir}"
+        f"Momentum gucu (QQE): {sig['momentum_gucu']}\n"
         f"Hacim / 20-ort. oran: {sig['volume_ratio']}\n\n"
-        f"On kosul: QQE momentum donusu + fiyatin guclu bir S/R bolgesine yakinligi.\n"
-        f"Guven puani: Kalman 1G trend(3) + Kalman 4S trend(3) + hacim(2) + bolge gucu(1-2).\n"
+        f"On kosul: QQE momentum donusu + fiyatin bir S/R bolgesine yakinligi.\n"
+        f"Guven puani: bolge gucu(3) + bolgeye yakinlik(3) + momentum gucu(2) + hacim(2).\n"
         f"8-10 Yuksek, 5-7 Orta guven demektir.\n"
         f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
