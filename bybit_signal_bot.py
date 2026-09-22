@@ -14,10 +14,8 @@ ZORUNLU ON KOSUL (ikisi de sart):
 
 GUVEN PUANI (10 uzerinden, sadece ON KOSUL saglaninca hesaplanir):
   - Bolge GUCU (kac kez test edilmis): maks 3 puan
-  - Bolgeye YAKINLIK (ne kadar yakin, ne kadar keskin bir reaksiyon
-    bolgesi): maks 3 puan
-  - QQE momentum GUCU (RSI'nin kendi bandini ne kadar asarak kestigi -
-    zayif/gucuk kesisim ayrimi): maks 2 puan
+  - Bolgeye YAKINLIK: maks 3 puan
+  - QQE momentum GUCU: maks 2 puan
   - Hacim teyidi: maks 2 puan
 
 Guven esikleri: 8-10 = YUKSEK, 5-7 = ORTA, 5 alti = sinyal yok.
@@ -40,10 +38,6 @@ from datetime import datetime, timezone, timedelta
 
 warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------
-# AYARLAR
-# ----------------------------------------------------------------------
-
 CRYPTO_SYMBOLS = [
     "BTC", "ETH", "XRP", "SUI", "HYPE", "AVAX", "ARB", "APT",
     "FET", "RENDER", "TIA", "DOGE", "SOL",
@@ -55,28 +49,24 @@ YF_SUFFIX = "-USD"
 YF_TICKER_OVERRIDES = {
     "SUI": "SUI20947", "HYPE": "HYPE32196", "APT": "APT21794", "TAO": "TAO22974",
 }
-TREND_PERIOD = "730d"       # 4S S/R bolgelerini olusturmak icin gerekli
+TREND_PERIOD = "730d"
 TREND_INTERVAL = "1h"
 TRIGGER_PERIOD = "60d"
 TRIGGER_INTERVAL = "15m"
 
-# --- QQE (momentum donusu) ---
 QQE_RSI_PERIOD = 14
 QQE_SMOOTHING = 5
 QQE_FACTOR = 4.236
 QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
-# --- Destek/Direnc bolgesi ---
 SR_SWING_ORDER = 3
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 2
 SR_PROXIMITY_PCT = 0.015
 
-# --- Hacim ---
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.2
 
-# --- Guven puanlama esikleri ---
 MAX_PUAN = 10
 ESIK_ORTA_GUVEN = 5
 ESIK_YUKSEK_GUVEN = 8
@@ -85,15 +75,11 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 TR_TZ = timezone(timedelta(hours=3))
 
 
-# ----------------------------------------------------------------------
-# TEMEL INDIKATORLER
-# ----------------------------------------------------------------------
-
-def ema(series: pd.Series, period: int) -> pd.Series:
+def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -103,16 +89,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return (100 - (100 / (1 + rs))).fillna(50)
 
 
-# ----------------------------------------------------------------------
-# QQE MOMENTUM DONUSU (+ kesisim GUCU olcumu)
-# ----------------------------------------------------------------------
-
-def compute_qqe(close: pd.Series):
-    """
-    Doner: bullish_cross, bearish_cross (bool serileri) ve
-    cross_strength (kesisim anindaki RSI'nin bandi ne kadar astigini,
-    bandin genisligine oranla olcen - 0'dan yukari, buyuk = guclu donus).
-    """
+def compute_qqe(close):
     rsi_val = rsi(close, QQE_RSI_PERIOD)
     rsi_ma = ema(rsi_val, QQE_SMOOTHING)
     atr_rsi = rsi_ma.diff().abs()
@@ -148,8 +125,6 @@ def compute_qqe(close: pd.Series):
     bullish_cross = (trend_s == 1) & (trend_s.shift(1) != 1)
     bearish_cross = (trend_s == -1) & (trend_s.shift(1) != -1)
 
-    # Kesisim gucu: RSI'nin, kesilen bandin ne kadar UZAGINA gectigi,
-    # bandin genisligine (dar) oranla - buyuk oran = guclu/net donus
     shortband_prev = pd.Series(shortband, index=close.index).shift(1)
     longband_prev = pd.Series(longband, index=close.index).shift(1)
     dar_safe = dar.replace(0, np.nan)
@@ -161,11 +136,7 @@ def compute_qqe(close: pd.Series):
     return bullish_cross, bearish_cross, cross_strength
 
 
-# ----------------------------------------------------------------------
-# DESTEK / DIRENC BOLGELERI
-# ----------------------------------------------------------------------
-
-def find_sr_zones(df_htf: pd.DataFrame):
+def find_sr_zones(df_htf):
     window = 2 * SR_SWING_ORDER + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
@@ -225,19 +196,15 @@ def nearest_below_any(price, zones):
     return cands[0][1], cands[0][2]
 
 
-# ----------------------------------------------------------------------
-# PUANLAMA YARDIMCILARI (veriye dayali: bolge gucu + yakinlik + momentum + hacim)
-# ----------------------------------------------------------------------
-
-def puan_bolge_guc(touches: int) -> int:
+def puan_bolge_guc(touches):
     if touches >= 6:
         return 3
     if touches >= 4:
         return 2
-    return 1  # min 2 dokunma zaten gate icin sart
+    return 1
 
 
-def puan_yakinlik(dist_pct: float) -> int:
+def puan_yakinlik(dist_pct):
     if dist_pct <= 0.005:
         return 3
     if dist_pct <= 0.010:
@@ -245,7 +212,7 @@ def puan_yakinlik(dist_pct: float) -> int:
     return 1
 
 
-def puan_momentum(strength: float) -> int:
+def puan_momentum(strength):
     if strength >= 0.5:
         return 2
     if strength >= 0.15:
@@ -253,15 +220,11 @@ def puan_momentum(strength: float) -> int:
     return 0
 
 
-def puan_hacim(spike: bool) -> int:
+def puan_hacim(spike):
     return 2 if spike else 0
 
 
-# ----------------------------------------------------------------------
-# VERI CEKME
-# ----------------------------------------------------------------------
-
-def fetch_history(base: str, period: str, interval: str) -> pd.DataFrame | None:
+def fetch_history(base, period, interval):
     ticker = f"{YF_TICKER_OVERRIDES.get(base, base)}{YF_SUFFIX}"
     try:
         df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
@@ -284,7 +247,7 @@ def fetch_history(base: str, period: str, interval: str) -> pd.DataFrame | None:
     return df[["dt", "Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
 
 
-def resample(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
+def resample(df_1h, rule):
     df = df_1h.set_index("dt")
     out = df.resample(rule, label="right", closed="right").agg({
         "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
@@ -292,11 +255,7 @@ def resample(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.reset_index()
 
 
-# ----------------------------------------------------------------------
-# ANA STRATEJI
-# ----------------------------------------------------------------------
-
-def evaluate_symbol(base: str) -> dict | None:
+def evaluate_symbol(base):
     df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
     if df_trend_1h is None or len(df_trend_1h) < 200 * 24:
         return None
@@ -355,42 +314,28 @@ def evaluate_symbol(base: str) -> dict | None:
     candle_ts = int(df_trig["dt"].iloc[i].timestamp() * 1000)
 
     return {
-        "symbol": base,
-        "direction": direction,
-        "puan": puan,
-        "guven": guven_etiketi,
-        "candle_ts": candle_ts,
-        "price": price_now,
-        "bolge_fiyat": bolge[0],
-        "bolge_dokunma": bolge[1],
-        "bolge_uzaklik_%": round(bolge[2] * 100, 2),
+        "symbol": base, "direction": direction, "puan": puan, "guven": guven_etiketi,
+        "candle_ts": candle_ts, "price": price_now, "bolge_fiyat": bolge[0],
+        "bolge_dokunma": bolge[1], "bolge_uzaklik_%": round(bolge[2] * 100, 2),
         "momentum_gucu": round(strength_now, 2),
         "tp_hedef": tp_hedef[0] if tp_hedef else None,
         "volume_ratio": round(float(vol_now / vol_ma_now), 2) if vol_ma_now else None,
     }
 
 
-# ----------------------------------------------------------------------
-# DURUM (DEDUPE) YONETIMI
-# ----------------------------------------------------------------------
-
-def load_state() -> dict:
+def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_state(state: dict) -> None:
+def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-# ----------------------------------------------------------------------
-# MAIL GONDERME
-# ----------------------------------------------------------------------
-
-def send_email(subject: str, body: str) -> None:
+def send_email(subject, body):
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
     to_email = os.environ["TO_EMAIL"]
@@ -405,7 +350,7 @@ def send_email(subject: str, body: str) -> None:
         server.sendmail(gmail_address, [to_email], msg.as_string())
 
 
-def format_signal_email(sig: dict) -> tuple[str, str]:
+def format_signal_email(sig):
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
     subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
@@ -428,10 +373,6 @@ def format_signal_email(sig: dict) -> tuple[str, str]:
     )
     return subject, body
 
-
-# ----------------------------------------------------------------------
-# ANA AKIS
-# ----------------------------------------------------------------------
 
 def main():
     print(f"Toplam taranan sembol sayisi: {len(CRYPTO_SYMBOLS)}")
