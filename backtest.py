@@ -1,20 +1,8 @@
 """
-Backtest - Kalman Trend + QQE Momentum + S/R Bolgesi Stratejisi
-==================================================================
-Canli botla (bybit_signal_bot.py) BIREBIR AYNI mantigi gecmis veriye
-uygular. Her sinyal icin, sonraki 3 gun icinde HERHANGI BIR anda kac %
-lehte hareket gorduğunu (MFE) ve yolda ne kadar aleyhe gidildigini (MAE)
-olcer - "sinyali gorup kendi analizinle girip %5-10'da cikma" kullanim
-seklini yansitir.
-
-ONEMLI KISITLAMA: S/R bolgeleri, her coin icin TUM 4 saatlik gecmisten
-(730 gun) hesaplanir - yani gelecekteki fiyat hareketleri de bolge
-tespitine katkida bulunmus olabilir (hafif ileriye-bakis / lookahead).
-Canli botta bu sorun yok (o an sadece o ana kadarki veriyi gorur).
-Bu yuzden backtest sonuclari gercek performanstan biraz iyimser olabilir,
-yorumlarken bunu akilda tut.
-
-Sonuc: results/backtest_sonuclari.csv ve konsola ozet istatistikler.
+Backtest v3 - Bolge Gucu + Yakinlik + Momentum + Hacim odakli strateji
+========================================================================
+Canli botla birebir ayni mantik. Trend puanlamadan cikarildi (onceki
+testte anti-korelasyon gosterdi). Sonuc: results/backtest_sonuclari.csv
 """
 
 import yfinance as yf
@@ -27,10 +15,6 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------
-# AYARLAR (bybit_signal_bot.py ile birebir ayni)
-# ----------------------------------------------------------------------
-
 CRYPTO_SYMBOLS = [
     "BTC", "ETH", "XRP", "SUI", "HYPE", "AVAX", "ARB", "APT",
     "FET", "RENDER", "TIA", "DOGE", "SOL",
@@ -40,10 +24,7 @@ CRYPTO_SYMBOLS = [
 
 YF_SUFFIX = "-USD"
 YF_TICKER_OVERRIDES = {
-    "SUI": "SUI20947",
-    "HYPE": "HYPE32196",
-    "APT": "APT21794",
-    "TAO": "TAO22974",
+    "SUI": "SUI20947", "HYPE": "HYPE32196", "APT": "APT21794", "TAO": "TAO22974",
 }
 TREND_PERIOD = "730d"
 TREND_INTERVAL = "1h"
@@ -55,37 +36,23 @@ QQE_SMOOTHING = 5
 QQE_FACTOR = 4.236
 QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
-KALMAN_PROCESS_VAR = 1e-5
-KALMAN_MEASUREMENT_VAR = 1e-2
-KALMAN_SLOPE_LOOKBACK = 5
-
 SR_SWING_ORDER = 3
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 2
-SR_STRONG_TOUCHES = 4
 SR_PROXIMITY_PCT = 0.015
 
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.2
 
-PUAN_KALMAN_1G = 3
-PUAN_KALMAN_4S = 3
-PUAN_HACIM = 2
-PUAN_BOLGE_GUC_ZAYIF = 1
-PUAN_BOLGE_GUC_GUCLU = 2
-MAX_PUAN = PUAN_KALMAN_1G + PUAN_KALMAN_4S + PUAN_HACIM + PUAN_BOLGE_GUC_GUCLU
+MAX_PUAN = 10
 ESIK_ORTA_GUVEN = 5
 ESIK_YUKSEK_GUVEN = 8
 
-MFE_HORIZON = 288  # 3 gun (15dk mum sayisi)
+MFE_HORIZON = 288
 HEDEF_YUZDELER = [3, 5, 7, 10]
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
-
-# ----------------------------------------------------------------------
-# INDIKATORLER (canli botla ayni)
-# ----------------------------------------------------------------------
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -101,29 +68,7 @@ def rsi(series, period=14):
     return (100 - (100 / (1 + rs))).fillna(50)
 
 
-def kalman_smooth(prices, process_var=KALMAN_PROCESS_VAR, measurement_var=KALMAN_MEASUREMENT_VAR):
-    n = len(prices)
-    xhat = np.zeros(n)
-    P = np.zeros(n)
-    xhat[0] = prices[0]
-    P[0] = 1.0
-    for k in range(1, n):
-        P_minus = P[k - 1] + process_var
-        K = P_minus / (P_minus + measurement_var)
-        xhat[k] = xhat[k - 1] + K * (prices[k] - xhat[k - 1])
-        P[k] = (1 - K) * P_minus
-    return xhat
-
-
-def kalman_trend_series(close: pd.Series, lookback=KALMAN_SLOPE_LOOKBACK):
-    """Her nokta icin (gecmise bakarak, o ana kadarki veriyle) Kalman egimini dondurur."""
-    xhat = kalman_smooth(close.values)
-    xhat_s = pd.Series(xhat, index=close.index)
-    egim = xhat_s - xhat_s.shift(lookback)
-    return egim
-
-
-def compute_qqe(close: pd.Series):
+def compute_qqe(close):
     rsi_val = rsi(close, QQE_RSI_PERIOD)
     rsi_ma = ema(rsi_val, QQE_SMOOTHING)
     atr_rsi = rsi_ma.diff().abs()
@@ -158,7 +103,16 @@ def compute_qqe(close: pd.Series):
     trend_s = pd.Series(trend, index=close.index)
     bullish_cross = (trend_s == 1) & (trend_s.shift(1) != 1)
     bearish_cross = (trend_s == -1) & (trend_s.shift(1) != -1)
-    return bullish_cross, bearish_cross
+
+    shortband_prev = pd.Series(shortband, index=close.index).shift(1)
+    longband_prev = pd.Series(longband, index=close.index).shift(1)
+    dar_safe = dar.replace(0, np.nan)
+    bull_strength = ((rsi_ma - shortband_prev) / dar_safe).clip(lower=0)
+    bear_strength = ((longband_prev - rsi_ma) / dar_safe).clip(lower=0)
+    cross_strength = np.where(bullish_cross, bull_strength, np.where(bearish_cross, bear_strength, 0.0))
+    cross_strength = pd.Series(cross_strength, index=close.index).fillna(0.0)
+
+    return bullish_cross, bearish_cross, cross_strength
 
 
 def find_sr_zones(df_htf):
@@ -193,7 +147,7 @@ def zone_below(price, zones, max_pct=SR_PROXIMITY_PCT):
         return None
     cands.sort()
     dist, zp, t = cands[0]
-    return (zp, t) if dist / price <= max_pct else None
+    return (zp, t, dist / price) if dist / price <= max_pct else None
 
 
 def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
@@ -202,12 +156,36 @@ def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
         return None
     cands.sort()
     dist, zp, t = cands[0]
-    return (zp, t) if dist / price <= max_pct else None
+    return (zp, t, dist / price) if dist / price <= max_pct else None
 
 
-# ----------------------------------------------------------------------
-# VERI CEKME
-# ----------------------------------------------------------------------
+def puan_bolge_guc(touches):
+    if touches >= 6:
+        return 3
+    if touches >= 4:
+        return 2
+    return 1
+
+
+def puan_yakinlik(dist_pct):
+    if dist_pct <= 0.005:
+        return 3
+    if dist_pct <= 0.010:
+        return 2
+    return 1
+
+
+def puan_momentum(strength):
+    if strength >= 0.5:
+        return 2
+    if strength >= 0.15:
+        return 1
+    return 0
+
+
+def puan_hacim(spike):
+    return 2 if spike else 0
+
 
 def fetch_history(base, period, interval, retries=4):
     ticker = f"{YF_TICKER_OVERRIDES.get(base, base)}{YF_SUFFIX}"
@@ -242,11 +220,7 @@ def resample(df_1h, rule):
     return out.reset_index()
 
 
-# ----------------------------------------------------------------------
-# TUM GECMIS ICIN TARAMA
-# ----------------------------------------------------------------------
-
-def backtest_symbol(base: str):
+def backtest_symbol(base):
     df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
     time.sleep(2)
     df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
@@ -257,77 +231,48 @@ def backtest_symbol(base: str):
         return pd.DataFrame(), False
 
     df_4h = resample(df_trend_1h, "4h")
-    df_1d = resample(df_trend_1h, "1D")
-    if len(df_1d) < 30 or len(df_4h) < 60:
+    if len(df_4h) < 60:
         return pd.DataFrame(), False
 
-    # Kalman egimleri - HER NOKTA icin (o ana kadarki veriyle) hesaplanir
-    egim_1d_series = kalman_trend_series(df_1d["Close"])
-    egim_4h_series = kalman_trend_series(df_4h["Close"])
-    df_1d = df_1d.copy()
-    df_4h = df_4h.copy()
-    df_1d["kalman_up"] = egim_1d_series > 0
-    df_1d["kalman_down"] = egim_1d_series < 0
-    df_4h["kalman_up"] = egim_4h_series > 0
-    df_4h["kalman_down"] = egim_4h_series < 0
-
-    # S/R bolgeleri - NOT: tum 4S gecmisinden (bkz. dosya basindaki kisitlama notu)
     destek_bolgeleri, direnc_bolgeleri = find_sr_zones(df_4h)
 
     trig = df_trig.sort_values("dt").reset_index(drop=True)
-    trig = pd.merge_asof(trig, df_1d[["dt", "kalman_up", "kalman_down"]].rename(
-        columns={"kalman_up": "kalman_up_1d", "kalman_down": "kalman_down_1d"}), on="dt", direction="backward")
-    trig = pd.merge_asof(trig, df_4h[["dt", "kalman_up", "kalman_down"]].rename(
-        columns={"kalman_up": "kalman_up_4h", "kalman_down": "kalman_down_4h"}), on="dt", direction="backward")
-    trig["kalman_up_1d"] = trig["kalman_up_1d"].fillna(False)
-    trig["kalman_down_1d"] = trig["kalman_down_1d"].fillna(False)
-    trig["kalman_up_4h"] = trig["kalman_up_4h"].fillna(False)
-    trig["kalman_down_4h"] = trig["kalman_down_4h"].fillna(False)
-
-    qqe_bull, qqe_bear = compute_qqe(trig["Close"])
+    qqe_bull, qqe_bear, qqe_strength = compute_qqe(trig["Close"])
     vol_ma = trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
     volume_spike = (vol_ma > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * vol_ma)
 
     closes = trig["Close"].values
     n = len(trig)
-
     kayitlar = []
+
     for i in range(n):
-        if not (bool(qqe_bull.iloc[i]) or bool(qqe_bear.iloc[i])):
+        bull_now = bool(qqe_bull.iloc[i])
+        bear_now = bool(qqe_bear.iloc[i])
+        if not (bull_now or bear_now):
             continue
         price_now = closes[i]
 
-        long_kapi = bool(qqe_bull.iloc[i]) and (zone_below(price_now, destek_bolgeleri) is not None)
-        short_kapi = bool(qqe_bear.iloc[i]) and (zone_above(price_now, direnc_bolgeleri) is not None)
-        if not (long_kapi or short_kapi):
+        long_zone = zone_below(price_now, destek_bolgeleri) if bull_now else None
+        short_zone = zone_above(price_now, direnc_bolgeleri) if bear_now else None
+        if long_zone is None and short_zone is None:
             continue
 
+        strength_now = float(qqe_strength.iloc[i])
+        spike_now = bool(volume_spike.iloc[i])
+
         long_puan = short_puan = 0
-        long_bolge = short_bolge = None
+        if long_zone is not None:
+            _, touches, dist_pct = long_zone
+            long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                         + puan_momentum(strength_now) + puan_hacim(spike_now))
+        if short_zone is not None:
+            _, touches, dist_pct = short_zone
+            short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                          + puan_momentum(strength_now) + puan_hacim(spike_now))
 
-        if long_kapi:
-            long_bolge = zone_below(price_now, destek_bolgeleri)
-            if trig["kalman_up_1d"].iloc[i]:
-                long_puan += PUAN_KALMAN_1G
-            if trig["kalman_up_4h"].iloc[i]:
-                long_puan += PUAN_KALMAN_4S
-            if volume_spike.iloc[i]:
-                long_puan += PUAN_HACIM
-            long_puan += PUAN_BOLGE_GUC_GUCLU if long_bolge[1] >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
-
-        if short_kapi:
-            short_bolge = zone_above(price_now, direnc_bolgeleri)
-            if trig["kalman_down_1d"].iloc[i]:
-                short_puan += PUAN_KALMAN_1G
-            if trig["kalman_down_4h"].iloc[i]:
-                short_puan += PUAN_KALMAN_4S
-            if volume_spike.iloc[i]:
-                short_puan += PUAN_HACIM
-            short_puan += PUAN_BOLGE_GUC_GUCLU if short_bolge[1] >= SR_STRONG_TOUCHES else PUAN_BOLGE_GUC_ZAYIF
-
-        if long_puan >= short_puan and long_kapi:
+        if long_zone is not None and long_puan >= short_puan:
             direction, puan = "LONG", long_puan
-        elif short_kapi:
+        elif short_zone is not None:
             direction, puan = "SHORT", short_puan
         else:
             continue
@@ -337,7 +282,6 @@ def backtest_symbol(base: str):
 
         guven = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
 
-        # MFE/MAE
         start, end = i + 1, min(i + 1 + MFE_HORIZON, n)
         if start >= end:
             continue
@@ -362,10 +306,6 @@ def backtest_symbol(base: str):
         return pd.DataFrame(), True
     return pd.DataFrame(kayitlar), True
 
-
-# ----------------------------------------------------------------------
-# ANA AKIS
-# ----------------------------------------------------------------------
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -420,7 +360,7 @@ def main():
     print(df["symbol"].value_counts().to_string())
 
     print("\n" + "-" * 60)
-    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde, HERHANGI BIR anda):")
+    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde):")
     print("-" * 60)
     for h in HEDEF_YUZDELER:
         col = f"hedef_%{h}_ulasti"
