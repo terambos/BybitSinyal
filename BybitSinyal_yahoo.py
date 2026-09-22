@@ -353,7 +353,7 @@ def send_email(subject, body):
 def format_signal_email(sig):
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
-    subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
+    subject = f"[BybitSinyal-Yahoo-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
 
     tp_satir = f"Olasi TP (en yakin ters bolge): {sig['tp_hedef']}\n" if sig["tp_hedef"] else ""
 
