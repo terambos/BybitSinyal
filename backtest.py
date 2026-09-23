@@ -38,14 +38,19 @@ QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
 SR_SWING_ORDER = 3
 SR_CLUSTER_TOLERANCE = 0.015
-SR_MIN_TOUCHES = 2
-SR_PROXIMITY_PCT = 0.015
+SR_MIN_TOUCHES = 3
+SR_PROXIMITY_PCT = 0.010
 
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.2
+VOLUME_SPIKE_MULT = 1.5
 
 MAX_PUAN = 10
-ESIK_ORTA_GUVEN = 5
+ESIK_ORTA_GUVEN = 6
+QQE_MIN_STRENGTH = 0.15
+ATR_PERIOD = 14
+ATR_LOOKBACK = 50
+ATR_MIN_RATIO = 0.6
+SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
 ESIK_YUKSEK_GUVEN = 8
 
 MFE_HORIZON = 288
@@ -66,6 +71,13 @@ def rsi(series, period=14):
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def atr(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def compute_qqe(close):
@@ -240,15 +252,26 @@ def backtest_symbol(base):
     qqe_bull, qqe_bear, qqe_strength = compute_qqe(trig["Close"])
     vol_ma = trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
     volume_spike = (vol_ma > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * vol_ma)
+    atr_val = atr(trig, ATR_PERIOD)
+    atr_pct = atr_val / trig["Close"]
+    atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
+    atr_ok = atr_pct_avg.notna() & (atr_pct >= ATR_MIN_RATIO * atr_pct_avg)
 
     closes = trig["Close"].values
     n = len(trig)
     kayitlar = []
+    last_signal_idx = None
+    COOLDOWN_CANDLES = 16  # 4 saat = 16 x 15dk
 
     for i in range(n):
-        bull_now = bool(qqe_bull.iloc[i])
-        bear_now = bool(qqe_bear.iloc[i])
+        if not bool(atr_ok.iloc[i]):
+            continue
+        strength_check = float(qqe_strength.iloc[i])
+        bull_now = bool(qqe_bull.iloc[i]) and strength_check >= QQE_MIN_STRENGTH
+        bear_now = bool(qqe_bear.iloc[i]) and strength_check >= QQE_MIN_STRENGTH
         if not (bull_now or bear_now):
+            continue
+        if last_signal_idx is not None and (i - last_signal_idx) < COOLDOWN_CANDLES:
             continue
         price_now = closes[i]
 
@@ -301,6 +324,7 @@ def backtest_symbol(base):
         for h in HEDEF_YUZDELER:
             kayit[f"hedef_%{h}_ulasti"] = mfe >= h
         kayitlar.append(kayit)
+        last_signal_idx = i
 
     if not kayitlar:
         return pd.DataFrame(), True
