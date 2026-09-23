@@ -32,8 +32,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           TEST_EMAIL: ${{ inputs.test_email }}
-        run: python bybit_signal_bot.py
-
+        run:    run: python BybitSinyal_yahoo.py
       - name: Durumu (state.json) geri kaydet
         run: |
           git config user.name "signal-bot"
