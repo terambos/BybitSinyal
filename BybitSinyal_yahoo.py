@@ -61,14 +61,19 @@ QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
 SR_SWING_ORDER = 3
 SR_CLUSTER_TOLERANCE = 0.015
-SR_MIN_TOUCHES = 2
-SR_PROXIMITY_PCT = 0.015
+SR_MIN_TOUCHES = 3
+SR_PROXIMITY_PCT = 0.010
 
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.2
+VOLUME_SPIKE_MULT = 1.5
 
 MAX_PUAN = 10
-ESIK_ORTA_GUVEN = 5
+ESIK_ORTA_GUVEN = 6
+QQE_MIN_STRENGTH = 0.15
+ATR_PERIOD = 14
+ATR_LOOKBACK = 50
+ATR_MIN_RATIO = 0.6
+SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
 ESIK_YUKSEK_GUVEN = 8
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -87,6 +92,13 @@ def rsi(series, period=14):
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def atr(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def compute_qqe(close):
@@ -272,15 +284,22 @@ def evaluate_symbol(base):
 
     qqe_bull, qqe_bear, qqe_strength = compute_qqe(df_trig["Close"])
     vol_ma = df_trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
+    atr_val = atr(df_trig, ATR_PERIOD)
+    atr_pct = atr_val / df_trig["Close"]
+    atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
 
     i = len(df_trig) - 1
     price_now = float(df_trig["Close"].iloc[i])
-    qqe_bull_now = bool(qqe_bull.iloc[i])
-    qqe_bear_now = bool(qqe_bear.iloc[i])
     strength_now = float(qqe_strength.iloc[i])
+    qqe_bull_now = bool(qqe_bull.iloc[i]) and strength_now >= QQE_MIN_STRENGTH
+    qqe_bear_now = bool(qqe_bear.iloc[i]) and strength_now >= QQE_MIN_STRENGTH
     vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
     volume_spike = bool(vol_ma_now > 0 and vol_now >= VOLUME_SPIKE_MULT * vol_ma_now)
+
+    atr_ok = pd.notna(atr_pct_avg.iloc[i]) and atr_pct.iloc[i] >= ATR_MIN_RATIO * atr_pct_avg.iloc[i]
+    if not atr_ok:
+        return None
 
     long_zone = zone_below(price_now, destek_bolgeleri) if qqe_bull_now else None
     short_zone = zone_above(price_now, direnc_bolgeleri) if qqe_bear_now else None
@@ -353,7 +372,7 @@ def send_email(subject, body):
 def format_signal_email(sig):
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
-    subject = f"[BybitSinyal-Yahoo-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
+    subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
 
     tp_satir = f"Olasi TP (en yakin ters bolge): {sig['tp_hedef']}\n" if sig["tp_hedef"] else ""
 
@@ -403,10 +422,10 @@ def main():
         if result is None:
             continue
 
-        key = f"{result['symbol']}::{result['direction']}"
+        key = result["symbol"]
         last_sent_ts = state.get(key)
-        if last_sent_ts == result["candle_ts"]:
-            continue
+        if last_sent_ts and (result["candle_ts"] - last_sent_ts) < SYMBOL_COOLDOWN_MS:
+            continue  # ayni sembolde yakin zamanda sinyal atildi, celiskili/art arda mail onlenir
 
         new_signals.append(result)
         state[key] = result["candle_ts"]
