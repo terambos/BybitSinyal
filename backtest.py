@@ -404,4 +404,19 @@ def main():
 
     print("\n" + "-" * 60)
     print("GUVEN SEVIYESINE GORE HEDEF YAKALAMA:")
-    print("-" *
+    print("-" * 60)
+    for guven_lvl in ["YUKSEK", "ORTA"]:
+        alt = df[df["guven"] == guven_lvl]
+        if alt.empty:
+            print(f"{guven_lvl}: sinyal yok")
+            continue
+        print(f"{guven_lvl}: {len(alt)} sinyal")
+        for h in [5, 10]:
+            col = f"hedef_%{h}_ulasti"
+            print(f"    -> %{h} hedefe ulasan oran: %{alt[col].mean()*100:.1f}")
+
+    print(f"\nTum detaylar kaydedildi: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
