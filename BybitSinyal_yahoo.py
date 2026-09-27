@@ -59,10 +59,12 @@ QQE_SMOOTHING = 5
 QQE_FACTOR = 4.236
 QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
-SR_SWING_ORDER = 3
+SR_SWING_ORDER_4H = 3
+SR_SWING_ORDER_1D = 2   # gunluk veri daha az mum icerdigi icin daha kucuk pencere
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 3
 SR_PROXIMITY_PCT = 0.010
+SR_DAILY_TOUCH_BONUS = 2   # gunluk bolgeler, ayni dokunma sayisinda 4S'ten daha guclu sayilir
 
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.5
@@ -148,8 +150,8 @@ def compute_qqe(close):
     return bullish_cross, bearish_cross, cross_strength
 
 
-def find_sr_zones(df_htf):
-    window = 2 * SR_SWING_ORDER + 1
+def find_sr_zones(df_htf, swing_order):
+    window = 2 * swing_order + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
     swing_high_mask = df_htf["High"] == roll_max
@@ -273,10 +275,18 @@ def evaluate_symbol(base):
         return None
 
     df_4h = resample(df_trend_1h, "4h")
+    df_1d = resample(df_trend_1h, "1D")
     if len(df_4h) < 60:
         return None
 
-    destek_bolgeleri, direnc_bolgeleri = find_sr_zones(df_4h)
+    destek_4h, direnc_4h = find_sr_zones(df_4h, SR_SWING_ORDER_4H)
+    destek_bolgeleri, direnc_bolgeleri = list(destek_4h), list(direnc_4h)
+
+    if len(df_1d) >= 2 * SR_SWING_ORDER_1D + 5:
+        destek_1d, direnc_1d = find_sr_zones(df_1d, SR_SWING_ORDER_1D)
+        # gunluk bolgeler daha anlamli oldugu icin dokunma sayisina bonus verilir
+        destek_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in destek_1d]
+        direnc_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in direnc_1d]
 
     df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
     if df_trig is None or len(df_trig) < 100:
@@ -423,24 +433,4 @@ def main():
             continue
 
         key = result["symbol"]
-        last_sent_ts = state.get(key)
-        if last_sent_ts and (result["candle_ts"] - last_sent_ts) < SYMBOL_COOLDOWN_MS:
-            continue  # ayni sembolde yakin zamanda sinyal atildi, celiskili/art arda mail onlenir
-
-        new_signals.append(result)
-        state[key] = result["candle_ts"]
-
-    for sig in new_signals:
-        subject, body = format_signal_email(sig)
-        try:
-            send_email(subject, body)
-            print(f"Mail gonderildi: {subject}")
-        except Exception as e:
-            print(f"MAIL HATASI ({sig['symbol']}): {e}", file=sys.stderr)
-
-    save_state(state)
-    print(f"Tamamlandi. {len(new_signals)} yeni sinyal bulundu.")
-
-
-if __name__ == "__main__":
-    main()
+        last_sent_ts = state.get(
