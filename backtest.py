@@ -36,7 +36,9 @@ QQE_SMOOTHING = 5
 QQE_FACTOR = 4.236
 QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 
-SR_SWING_ORDER = 3
+SR_SWING_ORDER_4H = 3
+SR_SWING_ORDER_1D = 2
+SR_DAILY_TOUCH_BONUS = 2
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 3
 SR_PROXIMITY_PCT = 0.010
@@ -127,8 +129,8 @@ def compute_qqe(close):
     return bullish_cross, bearish_cross, cross_strength
 
 
-def find_sr_zones(df_htf):
-    window = 2 * SR_SWING_ORDER + 1
+def find_sr_zones(df_htf, swing_order):
+    window = 2 * swing_order + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
     swing_high_mask = df_htf["High"] == roll_max
@@ -243,10 +245,16 @@ def backtest_symbol(base):
         return pd.DataFrame(), False
 
     df_4h = resample(df_trend_1h, "4h")
+    df_1d = resample(df_trend_1h, "1D")
     if len(df_4h) < 60:
         return pd.DataFrame(), False
 
-    destek_bolgeleri, direnc_bolgeleri = find_sr_zones(df_4h)
+    destek_4h, direnc_4h = find_sr_zones(df_4h, SR_SWING_ORDER_4H)
+    destek_bolgeleri, direnc_bolgeleri = list(destek_4h), list(direnc_4h)
+    if len(df_1d) >= 2 * SR_SWING_ORDER_1D + 5:
+        destek_1d, direnc_1d = find_sr_zones(df_1d, SR_SWING_ORDER_1D)
+        destek_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in destek_1d]
+        direnc_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in direnc_1d]
 
     trig = df_trig.sort_values("dt").reset_index(drop=True)
     qqe_bull, qqe_bear, qqe_strength = compute_qqe(trig["Close"])
@@ -396,19 +404,4 @@ def main():
 
     print("\n" + "-" * 60)
     print("GUVEN SEVIYESINE GORE HEDEF YAKALAMA:")
-    print("-" * 60)
-    for guven_lvl in ["YUKSEK", "ORTA"]:
-        alt = df[df["guven"] == guven_lvl]
-        if alt.empty:
-            print(f"{guven_lvl}: sinyal yok")
-            continue
-        print(f"{guven_lvl}: {len(alt)} sinyal")
-        for h in [5, 10]:
-            col = f"hedef_%{h}_ulasti"
-            print(f"    -> %{h} hedefe ulasan oran: %{alt[col].mean()*100:.1f}")
-
-    print(f"\nTum detaylar kaydedildi: {out_path}")
-
-
-if __name__ == "__main__":
-    main()
+    print("-" *
