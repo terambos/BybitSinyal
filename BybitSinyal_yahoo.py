@@ -433,4 +433,24 @@ def main():
             continue
 
         key = result["symbol"]
-        last_sent_ts = state.get(
+        last_sent_ts = state.get(key)
+        if last_sent_ts and (result["candle_ts"] - last_sent_ts) < SYMBOL_COOLDOWN_MS:
+            continue  # ayni sembolde yakin zamanda sinyal atildi, celiskili/art arda mail onlenir
+
+        new_signals.append(result)
+        state[key] = result["candle_ts"]
+
+    for sig in new_signals:
+        subject, body = format_signal_email(sig)
+        try:
+            send_email(subject, body)
+            print(f"Mail gonderildi: {subject}")
+        except Exception as e:
+            print(f"MAIL HATASI ({sig['symbol']}): {e}", file=sys.stderr)
+
+    save_state(state)
+    print(f"Tamamlandi. {len(new_signals)} yeni sinyal bulundu.")
+
+
+if __name__ == "__main__":
+    main()
