@@ -65,6 +65,7 @@ SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 3
 SR_PROXIMITY_PCT = 0.010
 SR_DAILY_TOUCH_BONUS = 2   # gunluk bolgeler, ayni dokunma sayisinda 4S'ten daha guclu sayilir
+MIN_TP_DISTANCE_PCT = 0.03  # ters bolgeye (TP) en az %3 mesafe olmali, yoksa sikisik bolge
 
 VOLUME_MA_PERIOD = 20
 VOLUME_SPIKE_MULT = 1.5
@@ -147,7 +148,7 @@ def compute_qqe(close):
     cross_strength = np.where(bullish_cross, bull_strength, np.where(bearish_cross, bear_strength, 0.0))
     cross_strength = pd.Series(cross_strength, index=close.index).fillna(0.0)
 
-    return bullish_cross, bearish_cross, cross_strength
+    return bullish_cross, bearish_cross, cross_strength, trend_s
 
 
 def find_sr_zones(df_htf, swing_order):
@@ -292,7 +293,7 @@ def evaluate_symbol(base):
     if df_trig is None or len(df_trig) < 100:
         return None
 
-    qqe_bull, qqe_bear, qqe_strength = compute_qqe(df_trig["Close"])
+    qqe_bull, qqe_bear, qqe_strength, qqe_trend = compute_qqe(df_trig["Close"])
     vol_ma = df_trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
     atr_val = atr(df_trig, ATR_PERIOD)
     atr_pct = atr_val / df_trig["Close"]
@@ -300,9 +301,13 @@ def evaluate_symbol(base):
 
     i = len(df_trig) - 1
     price_now = float(df_trig["Close"].iloc[i])
-    strength_now = float(qqe_strength.iloc[i])
-    qqe_bull_now = bool(qqe_bull.iloc[i]) and strength_now >= QQE_MIN_STRENGTH
-    qqe_bear_now = bool(qqe_bear.iloc[i]) and strength_now >= QQE_MIN_STRENGTH
+    # Momentum TEYIDI: donus bir onceki mumda olmus olmali VE o yonde
+    # hala gecerli olmali (tek mumluk yanlis alarmlari eler, 15dk gecikmeli)
+    strength_now = float(qqe_strength.iloc[i - 1])
+    qqe_bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
+                     and strength_now >= QQE_MIN_STRENGTH)
+    qqe_bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
+                     and strength_now >= QQE_MIN_STRENGTH)
     vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
     volume_spike = bool(vol_ma_now > 0 and vol_now >= VOLUME_SPIKE_MULT * vol_ma_now)
@@ -334,6 +339,14 @@ def evaluate_symbol(base):
         direction, puan, bolge = "SHORT", short_puan, short_zone
         tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
     else:
+        return None
+
+    # Hedefe (TP) yeterli mesafe yoksa (sikisik bolge) sinyali ele - %5-10
+    # hedefine ulasma sansi yapisal olarak dusuk demektir
+    if tp_hedef is None:
+        return None
+    tp_dist_pct = abs(tp_hedef[0] - price_now) / price_now
+    if tp_dist_pct < MIN_TP_DISTANCE_PCT:
         return None
 
     if puan < ESIK_ORTA_GUVEN:
