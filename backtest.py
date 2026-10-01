@@ -39,6 +39,7 @@ QQE_WILDER_PERIOD = QQE_RSI_PERIOD * 2 - 1
 SR_SWING_ORDER_4H = 3
 SR_SWING_ORDER_1D = 2
 SR_DAILY_TOUCH_BONUS = 2
+MIN_TP_DISTANCE_PCT = 0.03
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 3
 SR_PROXIMITY_PCT = 0.010
@@ -126,7 +127,7 @@ def compute_qqe(close):
     cross_strength = np.where(bullish_cross, bull_strength, np.where(bearish_cross, bear_strength, 0.0))
     cross_strength = pd.Series(cross_strength, index=close.index).fillna(0.0)
 
-    return bullish_cross, bearish_cross, cross_strength
+    return bullish_cross, bearish_cross, cross_strength, trend_s
 
 
 def find_sr_zones(df_htf, swing_order):
@@ -171,6 +172,22 @@ def zone_above(price, zones, max_pct=SR_PROXIMITY_PCT):
     cands.sort()
     dist, zp, t = cands[0]
     return (zp, t, dist / price) if dist / price <= max_pct else None
+
+
+def nearest_above_any(price, zones):
+    cands = [(zp - price, zp, t) for zp, t in zones if zp > price]
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][1], cands[0][2]
+
+
+def nearest_below_any(price, zones):
+    cands = [(price - zp, zp, t) for zp, t in zones if zp < price]
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][1], cands[0][2]
 
 
 def puan_bolge_guc(touches):
@@ -257,7 +274,7 @@ def backtest_symbol(base):
         direnc_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in direnc_1d]
 
     trig = df_trig.sort_values("dt").reset_index(drop=True)
-    qqe_bull, qqe_bear, qqe_strength = compute_qqe(trig["Close"])
+    qqe_bull, qqe_bear, qqe_strength, qqe_trend = compute_qqe(trig["Close"])
     vol_ma = trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
     volume_spike = (vol_ma > 0) & (trig["Volume"] >= VOLUME_SPIKE_MULT * vol_ma)
     atr_val = atr(trig, ATR_PERIOD)
@@ -271,12 +288,15 @@ def backtest_symbol(base):
     last_signal_idx = None
     COOLDOWN_CANDLES = 16  # 4 saat = 16 x 15dk
 
-    for i in range(n):
+    for i in range(1, n):
         if not bool(atr_ok.iloc[i]):
             continue
-        strength_check = float(qqe_strength.iloc[i])
-        bull_now = bool(qqe_bull.iloc[i]) and strength_check >= QQE_MIN_STRENGTH
-        bear_now = bool(qqe_bear.iloc[i]) and strength_check >= QQE_MIN_STRENGTH
+        # Momentum TEYIDI: donus bir onceki mumda olmus, hala gecerli olmali
+        strength_check = float(qqe_strength.iloc[i - 1])
+        bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
+                    and strength_check >= QQE_MIN_STRENGTH)
+        bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
+                    and strength_check >= QQE_MIN_STRENGTH)
         if not (bull_now or bear_now):
             continue
         if last_signal_idx is not None and (i - last_signal_idx) < COOLDOWN_CANDLES:
@@ -288,7 +308,7 @@ def backtest_symbol(base):
         if long_zone is None and short_zone is None:
             continue
 
-        strength_now = float(qqe_strength.iloc[i])
+        strength_now = strength_check
         spike_now = bool(volume_spike.iloc[i])
 
         long_puan = short_puan = 0
@@ -303,9 +323,17 @@ def backtest_symbol(base):
 
         if long_zone is not None and long_puan >= short_puan:
             direction, puan = "LONG", long_puan
+            tp_hedef = nearest_above_any(price_now, direnc_bolgeleri)
         elif short_zone is not None:
             direction, puan = "SHORT", short_puan
+            tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
         else:
+            continue
+
+        if tp_hedef is None:
+            continue
+        tp_dist_pct = abs(tp_hedef[0] - price_now) / price_now
+        if tp_dist_pct < MIN_TP_DISTANCE_PCT:
             continue
 
         if puan < ESIK_ORTA_GUVEN:
