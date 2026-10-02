@@ -349,7 +349,7 @@ def evaluate_symbol(base):
     if tp_dist_pct < MIN_TP_DISTANCE_PCT:
         return None
 
-    if puan < ESIK_ORTA_GUVEN:
+    if puan < MIN_SINYAL_PUAN:
         return None
 
     guven_etiketi = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
