@@ -55,7 +55,7 @@ ATR_LOOKBACK = 50
 ATR_MIN_RATIO = 0.6
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
 ESIK_YUKSEK_GUVEN = 8
-MIN_SINYAL_PUAN = 9   # sadece en guclu sinyaller gonderilsin
+MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
 
 MFE_HORIZON = 288
 HEDEF_YUZDELER = [3, 5, 7, 10]
