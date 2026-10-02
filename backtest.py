@@ -336,7 +336,7 @@ def backtest_symbol(base):
         if tp_dist_pct < MIN_TP_DISTANCE_PCT:
             continue
 
-        if puan < ESIK_ORTA_GUVEN:
+        if puan < MIN_SINYAL_PUAN:
             continue
 
         guven = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
