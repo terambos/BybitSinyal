@@ -53,6 +53,12 @@ QQE_MIN_STRENGTH = 0.15
 ATR_PERIOD = 14
 ATR_LOOKBACK = 50
 ATR_MIN_RATIO = 0.6
+
+# ADX (trend gucu) ve anomali/haber-sicramasi filtresi - canli botla ayni
+ADX_PERIOD = 14
+ADX_MIN = 20
+ANOMALY_LOOKBACK = 3
+ANOMALY_ATR_MULT = 2.5
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
 ESIK_YUKSEK_GUVEN = 8
 MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
@@ -82,6 +88,27 @@ def atr(df, period=14):
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def adx(df, period=ADX_PERIOD):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr_ = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / (atr_ + 1e-9)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / (atr_ + 1e-9)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    adx_val = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_val, plus_di, minus_di
+
+
+def obv_rising_series(df, lookback=5):
+    obv = (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
+    return obv.diff(lookback) > 0
 
 
 def compute_qqe(close):
@@ -215,8 +242,12 @@ def puan_momentum(strength):
     return 0
 
 
-def puan_hacim(spike):
-    return 2 if spike else 0
+def puan_hacim(spike, obv_confirms):
+    if spike and obv_confirms:
+        return 2
+    if spike or obv_confirms:
+        return 1
+    return 0
 
 
 def fetch_history(base, period, interval, retries=4):
@@ -283,6 +314,24 @@ def backtest_symbol(base):
     atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
     atr_ok = atr_pct_avg.notna() & (atr_pct >= ATR_MIN_RATIO * atr_pct_avg)
 
+    # OBV (para akis yonu) ve anomali/haber-sicramasi filtresi - 15dk veriden
+    obv_up_series = obv_rising_series(trig)
+    bar_range = trig["High"] - trig["Low"]
+    anomaly_series = bar_range.rolling(ANOMALY_LOOKBACK).max() > (ANOMALY_ATR_MULT * atr_val)
+
+    # ADX (trend gucu) - 4S veriden, her 15dk mumuna o ana kadar bilinen en son 4S degeri eslenir
+    adx_4h, plus_di_4h, minus_di_4h = adx(df_4h)
+    adx_df = pd.DataFrame({
+        "dt": df_4h["dt"].reset_index(drop=True),
+        "adx": adx_4h.reset_index(drop=True),
+        "plus_di": plus_di_4h.reset_index(drop=True),
+        "minus_di": minus_di_4h.reset_index(drop=True),
+    })
+    trig = pd.merge_asof(trig, adx_df, on="dt", direction="backward")
+    trend_guclu_series = trig["adx"].fillna(0) >= ADX_MIN
+    di_bull_series = trig["plus_di"].fillna(0) > trig["minus_di"].fillna(0)
+    di_bear_series = trig["minus_di"].fillna(0) > trig["plus_di"].fillna(0)
+
     closes = trig["Close"].values
     n = len(trig)
     kayitlar = []
@@ -292,12 +341,17 @@ def backtest_symbol(base):
     for i in range(1, n):
         if not bool(atr_ok.iloc[i]):
             continue
+        if bool(anomaly_series.iloc[i]):
+            continue  # ani haber/manipulasyon sicramasi
         # Momentum TEYIDI: donus bir onceki mumda olmus, hala gecerli olmali
         strength_check = float(qqe_strength.iloc[i - 1])
         bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
                     and strength_check >= QQE_MIN_STRENGTH)
         bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
                     and strength_check >= QQE_MIN_STRENGTH)
+        # ADX kapisi: trend zayifsa (yatay piyasa) sinyal aranmaz
+        bull_now = bull_now and bool(trend_guclu_series.iloc[i]) and bool(di_bull_series.iloc[i])
+        bear_now = bear_now and bool(trend_guclu_series.iloc[i]) and bool(di_bear_series.iloc[i])
         if not (bull_now or bear_now):
             continue
         if last_signal_idx is not None and (i - last_signal_idx) < COOLDOWN_CANDLES:
@@ -311,16 +365,17 @@ def backtest_symbol(base):
 
         strength_now = strength_check
         spike_now = bool(volume_spike.iloc[i])
+        obv_now = bool(obv_up_series.iloc[i])
 
         long_puan = short_puan = 0
         if long_zone is not None:
             _, touches, dist_pct = long_zone
             long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                         + puan_momentum(strength_now) + puan_hacim(spike_now))
+                         + puan_momentum(strength_now) + puan_hacim(spike_now, obv_now))
         if short_zone is not None:
             _, touches, dist_pct = short_zone
             short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                          + puan_momentum(strength_now) + puan_hacim(spike_now))
+                          + puan_momentum(strength_now) + puan_hacim(spike_now, not obv_now))
 
         if long_zone is not None and long_puan >= short_puan:
             direction, puan = "LONG", long_puan
