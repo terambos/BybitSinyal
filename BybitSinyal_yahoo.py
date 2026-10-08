@@ -76,6 +76,12 @@ QQE_MIN_STRENGTH = 0.15
 ATR_PERIOD = 14
 ATR_LOOKBACK = 50
 ATR_MIN_RATIO = 0.6
+
+# --- ADX (trend gucu) ve anomali/haber-sicramasi filtresi - kimi-signal-bot'tan alinan fikirler ---
+ADX_PERIOD = 14
+ADX_MIN = 20              # bunun altinda piyasa yatay/kararsiz sayilir, sinyal aranmaz
+ANOMALY_LOOKBACK = 3      # son kac 15dk mumda ani sicrama kontrolu yapilacak
+ANOMALY_ATR_MULT = 2.5    # bir mumun araligi ATR'nin bu katindan fazlaysa "supheli" sayilir
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
 ESIK_YUKSEK_GUVEN = 8
 MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
@@ -103,6 +109,40 @@ def atr(df, period=14):
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def adx(df, period=ADX_PERIOD):
+    """Trend gucu (ADX) + yon gostergeleri (+DI/-DI). Sadece OHLC gerektirir."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr_ = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / (atr_ + 1e-9)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / (atr_ + 1e-9)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    adx_val = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_val, plus_di, minus_di
+
+
+def obv_rising(df, lookback=5):
+    """OBV (On Balance Volume) egimi - hacmin yonle uyumlu olup olmadigini gosterir."""
+    obv = (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
+    return obv.diff(lookback) > 0
+
+
+def anomaly_spike(df, lookback=ANOMALY_LOOKBACK, atr_mult=ANOMALY_ATR_MULT):
+    """Son birkac mumda ATR'nin cok uzerinde bir sicrama varsa True doner -
+    haber/manipulasyon kaynakli ani hareketlerde sinyal uretmemek icin."""
+    atr_val = atr(df, ATR_PERIOD)
+    bar_range = (df["High"] - df["Low"]).iloc[-lookback:]
+    atr_now = atr_val.iloc[-1]
+    if pd.isna(atr_now) or atr_now <= 0 or bar_range.empty:
+        return False
+    return bool(bar_range.max() > atr_mult * atr_now)
 
 
 def compute_qqe(close):
@@ -236,8 +276,13 @@ def puan_momentum(strength):
     return 0
 
 
-def puan_hacim(spike):
-    return 2 if spike else 0
+def puan_hacim(spike, obv_confirms):
+    """Hacim patlamasi TEK BASINA degil, OBV (para akis yonu) ile birlikte tam puan alir."""
+    if spike and obv_confirms:
+        return 2
+    if spike or obv_confirms:
+        return 1
+    return 0
 
 
 def fetch_history(base, period, interval):
@@ -299,9 +344,22 @@ def evaluate_symbol(base):
     atr_val = atr(df_trig, ATR_PERIOD)
     atr_pct = atr_val / df_trig["Close"]
     atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
+    obv_up = obv_rising(df_trig)
 
     i = len(df_trig) - 1
     price_now = float(df_trig["Close"].iloc[i])
+
+    # ADX (trend gucu) - 4S veriden, piyasa yatay/kararsizsa sinyal aranmaz
+    adx_val, plus_di, minus_di = adx(df_4h)
+    adx_now = float(adx_val.iloc[-1])
+    di_bull = plus_di.iloc[-1] > minus_di.iloc[-1]
+    di_bear = minus_di.iloc[-1] > plus_di.iloc[-1]
+    trend_guclu = adx_now >= ADX_MIN
+
+    # Ani haber/manipulasyon sicramasi varsa bu turu atla
+    if anomaly_spike(df_trig):
+        return None
+
     # Momentum TEYIDI: donus bir onceki mumda olmus olmali VE o yonde
     # hala gecerli olmali (tek mumluk yanlis alarmlari eler, 15dk gecikmeli)
     strength_now = float(qqe_strength.iloc[i - 1])
@@ -309,9 +367,15 @@ def evaluate_symbol(base):
                      and strength_now >= QQE_MIN_STRENGTH)
     qqe_bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
                      and strength_now >= QQE_MIN_STRENGTH)
+
+    # ADX kapisi: trend zayifsa (yatay piyasa) o yonde sinyal aranmaz
+    qqe_bull_now = qqe_bull_now and trend_guclu and di_bull
+    qqe_bear_now = qqe_bear_now and trend_guclu and di_bear
+
     vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
     volume_spike = bool(vol_ma_now > 0 and vol_now >= VOLUME_SPIKE_MULT * vol_ma_now)
+    obv_now = bool(obv_up.iloc[i])
 
     atr_ok = pd.notna(atr_pct_avg.iloc[i]) and atr_pct.iloc[i] >= ATR_MIN_RATIO * atr_pct_avg.iloc[i]
     if not atr_ok:
@@ -327,11 +391,11 @@ def evaluate_symbol(base):
     if long_zone is not None:
         _, touches, dist_pct = long_zone
         long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                     + puan_momentum(strength_now) + puan_hacim(volume_spike))
+                     + puan_momentum(strength_now) + puan_hacim(volume_spike, obv_now))
     if short_zone is not None:
         _, touches, dist_pct = short_zone
         short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                      + puan_momentum(strength_now) + puan_hacim(volume_spike))
+                      + puan_momentum(strength_now) + puan_hacim(volume_spike, not obv_now))
 
     if long_zone is not None and long_puan >= short_puan:
         direction, puan, bolge = "LONG", long_puan, long_zone
@@ -363,6 +427,8 @@ def evaluate_symbol(base):
         "momentum_gucu": round(strength_now, 2),
         "tp_hedef": tp_hedef[0] if tp_hedef else None,
         "volume_ratio": round(float(vol_now / vol_ma_now), 2) if vol_ma_now else None,
+        "adx": round(adx_now, 1),
+        "obv_destekliyor": obv_now if direction == "LONG" else (not obv_now),
     }
 
 
@@ -408,7 +474,8 @@ def format_signal_email(sig):
         f"({sig['bolge_dokunma']} kez test edilmis, %{sig['bolge_uzaklik_%']} uzaklikta)\n"
         f"{tp_satir}"
         f"Momentum gucu (QQE): {sig['momentum_gucu']}\n"
-        f"Hacim / 20-ort. oran: {sig['volume_ratio']}\n\n"
+        f"Hacim / 20-ort. oran: {sig['volume_ratio']}  (OBV destekliyor mu: {'Evet' if sig['obv_destekliyor'] else 'Hayir'})\n"
+        f"ADX (4S trend gucu): {sig['adx']}  (20 uzeri = guclu trend)\n\n"
         f"On kosul: QQE momentum donusu + fiyatin bir S/R bolgesine yakinligi.\n"
         f"Guven puani: bolge gucu(3) + bolgeye yakinlik(3) + momentum gucu(2) + hacim(2).\n"
         f"8-10 Yuksek, 5-7 Orta guven demektir.\n"
