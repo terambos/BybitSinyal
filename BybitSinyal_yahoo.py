@@ -83,7 +83,7 @@ ADX_MIN = 20              # bunun altinda piyasa yatay/kararsiz sayilir, sinyal 
 ANOMALY_LOOKBACK = 3      # son kac 15dk mumda ani sicrama kontrolu yapilacak
 ANOMALY_ATR_MULT = 2.5    # bir mumun araligi ATR'nin bu katindan fazlaysa "supheli" sayilir
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
-ESIK_YUKSEK_GUVEN = 8
+ESIK_YUKSEK_GUVEN = 9   # 9-10 YUKSEK, 8 ORTA (etiket sadece puan bandidir, isabet garantisi degil)
 MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -192,7 +192,7 @@ def compute_qqe(close):
     return bullish_cross, bearish_cross, cross_strength, trend_s
 
 
-def find_sr_zones(df_htf, swing_order):
+def find_sr_zones(df_htf, swing_order, anchored=True):
     window = 2 * swing_order + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
@@ -205,7 +205,8 @@ def find_sr_zones(df_htf, swing_order):
         zones = []
         group = []
         for p in prices:
-            if not group or (p - group[-1]) / group[-1] <= SR_CLUSTER_TOLERANCE:
+            ref = (group[0] if anchored else group[-1]) if group else None
+            if ref is None or (p - ref) / ref <= SR_CLUSTER_TOLERANCE:
                 group.append(p)
             else:
                 if len(group) >= SR_MIN_TOUCHES:
@@ -323,6 +324,10 @@ def evaluate_symbol(base):
 
     df_4h = resample(df_trend_1h, "4h")
     df_1d = resample(df_trend_1h, "1D")
+    # Tamamlanmamis son 4S/1G mumunu at (ADX ve tepe/dip tespiti yarim mumla bozulmasin)
+    son_saat = df_trend_1h["dt"].iloc[-1]
+    df_4h = df_4h[df_4h["dt"] <= son_saat].reset_index(drop=True)
+    df_1d = df_1d[df_1d["dt"] <= son_saat].reset_index(drop=True)
     if len(df_4h) < 60:
         return None
 
@@ -460,7 +465,8 @@ def send_email(subject, body):
 
 
 def format_signal_email(sig):
-    dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
+    # candle_ts mumun BASLANGICIDIR; kapanis = baslangic + 15 dk
+    dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ) + timedelta(minutes=15)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
     subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
 
@@ -478,7 +484,7 @@ def format_signal_email(sig):
         f"ADX (4S trend gucu): {sig['adx']}  (20 uzeri = guclu trend)\n\n"
         f"On kosul: QQE momentum donusu + fiyatin bir S/R bolgesine yakinligi.\n"
         f"Guven puani: bolge gucu(3) + bolgeye yakinlik(3) + momentum gucu(2) + hacim(2).\n"
-        f"8-10 Yuksek, 5-7 Orta guven demektir.\n"
+        f"Sadece 8+ puan gonderilir: 9-10 YUKSEK, 8 ORTA etiketlenir. Etiket isabet garantisi degildir.\n"
         f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
     return subject, body
