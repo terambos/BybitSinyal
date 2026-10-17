@@ -63,7 +63,7 @@ SR_SWING_ORDER_4H = 3
 SR_SWING_ORDER_1D = 2   # gunluk veri daha az mum icerdigi icin daha kucuk pencere
 SR_CLUSTER_TOLERANCE = 0.015
 SR_MIN_TOUCHES = 3
-SR_PROXIMITY_PCT = 0.010
+SR_PROXIMITY_PCT = 0.012
 SR_DAILY_TOUCH_BONUS = 2   # gunluk bolgeler, ayni dokunma sayisinda 4S'ten daha guclu sayilir
 MIN_TP_DISTANCE_PCT = 0.03  # ters bolgeye (TP) en az %3 mesafe olmali, yoksa sikisik bolge
 
@@ -79,11 +79,11 @@ ATR_MIN_RATIO = 0.6
 
 # --- ADX (trend gucu) ve anomali/haber-sicramasi filtresi - kimi-signal-bot'tan alinan fikirler ---
 ADX_PERIOD = 14
-ADX_MIN = 20              # bunun altinda piyasa yatay/kararsiz sayilir, sinyal aranmaz
+ADX_MIN = 15              # bunun altinda piyasa yatay/kararsiz sayilir, sinyal aranmaz
 ANOMALY_LOOKBACK = 3      # son kac 15dk mumda ani sicrama kontrolu yapilacak
 ANOMALY_ATR_MULT = 2.5    # bir mumun araligi ATR'nin bu katindan fazlaysa "supheli" sayilir
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
-ESIK_YUKSEK_GUVEN = 8
+ESIK_YUKSEK_GUVEN = 9   # 9-10 YUKSEK, 8 ORTA (etiket sadece puan bandidir, isabet garantisi degil)
 MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -192,7 +192,7 @@ def compute_qqe(close):
     return bullish_cross, bearish_cross, cross_strength, trend_s
 
 
-def find_sr_zones(df_htf, swing_order):
+def find_sr_zones(df_htf, swing_order, anchored=True):
     window = 2 * swing_order + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
@@ -205,7 +205,8 @@ def find_sr_zones(df_htf, swing_order):
         zones = []
         group = []
         for p in prices:
-            if not group or (p - group[-1]) / group[-1] <= SR_CLUSTER_TOLERANCE:
+            ref = (group[0] if anchored else group[-1]) if group else None
+            if ref is None or (p - ref) / ref <= SR_CLUSTER_TOLERANCE:
                 group.append(p)
             else:
                 if len(group) >= SR_MIN_TOUCHES:
@@ -317,27 +318,32 @@ def resample(df_1h, rule):
 
 
 def evaluate_symbol(base):
+    """Doner: (sinyal_dict_veya_None, teshis_metni). teshis_metni sinyal
+    uretilmese bile HANGI sartin sagl anmadigini aciklar (log icin)."""
     df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
     if df_trend_1h is None or len(df_trend_1h) < 200 * 24:
-        return None
+        return None, "yetersiz 1S veri (Yahoo'dan cekilemedi/kisa gecmis)"
 
     df_4h = resample(df_trend_1h, "4h")
     df_1d = resample(df_trend_1h, "1D")
+    # Tamamlanmamis son 4S/1G mumunu at (ADX ve tepe/dip tespiti yarim mumla bozulmasin)
+    son_saat = df_trend_1h["dt"].iloc[-1]
+    df_4h = df_4h[df_4h["dt"] <= son_saat].reset_index(drop=True)
+    df_1d = df_1d[df_1d["dt"] <= son_saat].reset_index(drop=True)
     if len(df_4h) < 60:
-        return None
+        return None, "yetersiz 4S veri"
 
     destek_4h, direnc_4h = find_sr_zones(df_4h, SR_SWING_ORDER_4H)
     destek_bolgeleri, direnc_bolgeleri = list(destek_4h), list(direnc_4h)
 
     if len(df_1d) >= 2 * SR_SWING_ORDER_1D + 5:
         destek_1d, direnc_1d = find_sr_zones(df_1d, SR_SWING_ORDER_1D)
-        # gunluk bolgeler daha anlamli oldugu icin dokunma sayisina bonus verilir
         destek_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in destek_1d]
         direnc_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in direnc_1d]
 
     df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
     if df_trig is None or len(df_trig) < 100:
-        return None
+        return None, "yetersiz 15dk veri"
 
     qqe_bull, qqe_bear, qqe_strength, qqe_trend = compute_qqe(df_trig["Close"])
     vol_ma = df_trig["Volume"].rolling(VOLUME_MA_PERIOD).mean()
@@ -349,28 +355,24 @@ def evaluate_symbol(base):
     i = len(df_trig) - 1
     price_now = float(df_trig["Close"].iloc[i])
 
-    # ADX (trend gucu) - 4S veriden, piyasa yatay/kararsizsa sinyal aranmaz
     adx_val, plus_di, minus_di = adx(df_4h)
     adx_now = float(adx_val.iloc[-1])
-    di_bull = plus_di.iloc[-1] > minus_di.iloc[-1]
-    di_bear = minus_di.iloc[-1] > plus_di.iloc[-1]
     trend_guclu = adx_now >= ADX_MIN
 
-    # Ani haber/manipulasyon sicramasi varsa bu turu atla
     if anomaly_spike(df_trig):
-        return None
+        return None, f"ani fiyat sicramasi tespit edildi (haber/manipulasyon supheli), fiyat={price_now:.4g}"
 
-    # Momentum TEYIDI: donus bir onceki mumda olmus olmali VE o yonde
-    # hala gecerli olmali (tek mumluk yanlis alarmlari eler, 15dk gecikmeli)
     strength_now = float(qqe_strength.iloc[i - 1])
-    qqe_bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
-                     and strength_now >= QQE_MIN_STRENGTH)
-    qqe_bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
-                     and strength_now >= QQE_MIN_STRENGTH)
+    qqe_bull_raw = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
+                    and strength_now >= QQE_MIN_STRENGTH)
+    qqe_bear_raw = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
+                    and strength_now >= QQE_MIN_STRENGTH)
 
-    # ADX kapisi: trend zayifsa (yatay piyasa) o yonde sinyal aranmaz
-    qqe_bull_now = qqe_bull_now and trend_guclu and di_bull
-    qqe_bear_now = qqe_bear_now and trend_guclu and di_bear
+    # NOT: +DI/-DI yon sarti kaldirildi - onceki surumde SHORT sinyallerini
+    # neredeyse tamamen eliyordu (sinyal cok azalmisti). Sadece "piyasa yatay
+    # degil mi" (ADX>=ADX_MIN) kaliyor, yon kosulu QQE+bolgeden zaten geliyor.
+    qqe_bull_now = qqe_bull_raw and trend_guclu
+    qqe_bear_now = qqe_bear_raw and trend_guclu
 
     vol_now = df_trig["Volume"].iloc[i]
     vol_ma_now = vol_ma.iloc[i]
@@ -379,13 +381,24 @@ def evaluate_symbol(base):
 
     atr_ok = pd.notna(atr_pct_avg.iloc[i]) and atr_pct.iloc[i] >= ATR_MIN_RATIO * atr_pct_avg.iloc[i]
     if not atr_ok:
-        return None
+        return None, f"volatilite (ATR) cok dusuk, fiyat={price_now:.4g}, ADX={adx_now:.1f}"
+
+    if not (qqe_bull_raw or qqe_bear_raw):
+        return None, f"momentum donusu yok (QQE kesisim olmadi), fiyat={price_now:.4g}, ADX={adx_now:.1f}"
+
+    if not (qqe_bull_now or qqe_bear_now):
+        yon = "YUKARI" if qqe_bull_raw else "ASAGI"
+        return None, (f"momentum donusu VAR ({yon}) ama trend zayif/uyumsuz - "
+                       f"ADX={adx_now:.1f} (esik {ADX_MIN}), +DI={float(plus_di.iloc[-1]):.1f}, "
+                       f"-DI={float(minus_di.iloc[-1]):.1f}")
 
     long_zone = zone_below(price_now, destek_bolgeleri) if qqe_bull_now else None
     short_zone = zone_above(price_now, direnc_bolgeleri) if qqe_bear_now else None
 
     if long_zone is None and short_zone is None:
-        return None
+        yon = "LONG" if qqe_bull_now else "SHORT"
+        return None, (f"momentum+trend uygun ({yon}) ama fiyat hicbir S/R bolgesine yeterince "
+                       f"yakin degil (fiyat={price_now:.4g}, ADX={adx_now:.1f})")
 
     long_puan = short_puan = 0
     if long_zone is not None:
@@ -404,23 +417,24 @@ def evaluate_symbol(base):
         direction, puan, bolge = "SHORT", short_puan, short_zone
         tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
     else:
-        return None
+        return None, "beklenmeyen durum (yon belirlenemedi)"
 
-    # Hedefe (TP) yeterli mesafe yoksa (sikisik bolge) sinyali ele - %5-10
-    # hedefine ulasma sansi yapisal olarak dusuk demektir
     if tp_hedef is None:
-        return None
+        return None, (f"{direction} kosullari uygun (puan {puan}/{MAX_PUAN}) ama ters yonde "
+                       f"hic S/R bolgesi yok, TP hedefi kurulamiyor")
     tp_dist_pct = abs(tp_hedef[0] - price_now) / price_now
     if tp_dist_pct < MIN_TP_DISTANCE_PCT:
-        return None
+        return None, (f"{direction} kosullari uygun (puan {puan}/{MAX_PUAN}) ama hedefe mesafe "
+                       f"cok az (%{tp_dist_pct*100:.2f}, min %{MIN_TP_DISTANCE_PCT*100:.1f} gerekli) - sikisik bolge")
 
     if puan < MIN_SINYAL_PUAN:
-        return None
+        return None, (f"{direction} kosullari uygun ama puan yetersiz: {puan}/{MAX_PUAN} "
+                       f"(min {MIN_SINYAL_PUAN} gerekli)")
 
     guven_etiketi = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
     candle_ts = int(df_trig["dt"].iloc[i].timestamp() * 1000)
 
-    return {
+    sonuc = {
         "symbol": base, "direction": direction, "puan": puan, "guven": guven_etiketi,
         "candle_ts": candle_ts, "price": price_now, "bolge_fiyat": bolge[0],
         "bolge_dokunma": bolge[1], "bolge_uzaklik_%": round(bolge[2] * 100, 2),
@@ -430,6 +444,7 @@ def evaluate_symbol(base):
         "adx": round(adx_now, 1),
         "obv_destekliyor": obv_now if direction == "LONG" else (not obv_now),
     }
+    return sonuc, f"SINYAL URETILDI: {direction}, puan {puan}/{MAX_PUAN} ({guven_etiketi})"
 
 
 def load_state():
@@ -460,7 +475,8 @@ def send_email(subject, body):
 
 
 def format_signal_email(sig):
-    dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ)
+    # candle_ts mumun BASLANGICIDIR; kapanis = baslangic + 15 dk
+    dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ) + timedelta(minutes=15)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
     subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
 
@@ -478,7 +494,7 @@ def format_signal_email(sig):
         f"ADX (4S trend gucu): {sig['adx']}  (20 uzeri = guclu trend)\n\n"
         f"On kosul: QQE momentum donusu + fiyatin bir S/R bolgesine yakinligi.\n"
         f"Guven puani: bolge gucu(3) + bolgeye yakinlik(3) + momentum gucu(2) + hacim(2).\n"
-        f"8-10 Yuksek, 5-7 Orta guven demektir.\n"
+        f"Sadece 8+ puan gonderilir: 9-10 YUKSEK, 8 ORTA etiketlenir. Etiket isabet garantisi degildir.\n"
         f"Veri kaynagi: Yahoo Finance. Bu otomatik bir sinyaldir, yatirim tavsiyesi degildir.\n"
     )
     return subject, body
@@ -505,10 +521,12 @@ def main():
 
     for base in CRYPTO_SYMBOLS:
         try:
-            result = evaluate_symbol(base)
+            result, teshis = evaluate_symbol(base)
         except Exception as e:
             print(f"HATA ({base}): {e}", file=sys.stderr)
             continue
+
+        print(f"{base}: {teshis}")
 
         if result is None:
             continue
