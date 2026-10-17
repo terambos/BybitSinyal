@@ -60,10 +60,8 @@ ADX_MIN = 20
 ANOMALY_LOOKBACK = 3
 ANOMALY_ATR_MULT = 2.5
 SYMBOL_COOLDOWN_MS = 4 * 60 * 60 * 1000
-ESIK_YUKSEK_GUVEN = 9   # 9-10 YUKSEK, 8 ORTA (etiket sadece puan bandidir, isabet garantisi degil)
+ESIK_YUKSEK_GUVEN = 8
 MIN_SINYAL_PUAN = 8   # 9-10'a sikistirma denendi, isabeti artirmadi - 8'e geri donuldu
-SIRALI_HEDEF_PCT = 5.0   # sirali sonuc: once +%5'e mi, once -%3'e mi degdi
-SIRALI_STOP_PCT = 3.0
 
 MFE_HORIZON = 288
 HEDEF_YUZDELER = [3, 5, 7, 10]
@@ -160,7 +158,7 @@ def compute_qqe(close):
     return bullish_cross, bearish_cross, cross_strength, trend_s
 
 
-def find_sr_zones(df_htf, swing_order, anchored=True):
+def find_sr_zones(df_htf, swing_order):
     window = 2 * swing_order + 1
     roll_max = df_htf["High"].rolling(window, center=True).max()
     roll_min = df_htf["Low"].rolling(window, center=True).min()
@@ -173,8 +171,7 @@ def find_sr_zones(df_htf, swing_order, anchored=True):
         zones = []
         group = []
         for p in prices:
-            ref = (group[0] if anchored else group[-1]) if group else None
-            if ref is None or (p - ref) / ref <= SR_CLUSTER_TOLERANCE:
+            if not group or (p - group[-1]) / group[-1] <= SR_CLUSTER_TOLERANCE:
                 group.append(p)
             else:
                 if len(group) >= SR_MIN_TOUCHES:
@@ -286,37 +283,27 @@ def resample(df_1h, rule):
     return out.reset_index()
 
 
-def bolgeleri_hesapla(df_4h, df_1d, anchored):
-    d4, r4 = find_sr_zones(df_4h, SR_SWING_ORDER_4H, anchored)
-    destek, direnc = list(d4), list(r4)
-    if len(df_1d) >= 2 * SR_SWING_ORDER_1D + 5:
-        d1, r1 = find_sr_zones(df_1d, SR_SWING_ORDER_1D, anchored)
-        destek += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in d1]
-        direnc += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in r1]
-    return destek, direnc
-
-
 def backtest_symbol(base):
-    """
-    Ayni veri uzerinde IKI yontemi kosturur:
-      ESKI : S/R bolgeleri tum gecmisten (gelecek dahil), zincirleme kumeleme, ADX 1 saate kadar ileriye bakar
-      YENI : her sinyal icin SADECE o ana kadar TAMAMLANMIS 4S/1G mumlardan bolge, sabit capali kumeleme
-             (canli botun gercek davranisi budur)
-    Doner: ({"ESKI": df, "YENI": df}, veri_tamam_mi)
-    """
     df_trend_1h = fetch_history(base, TREND_PERIOD, TREND_INTERVAL)
     time.sleep(2)
     df_trig = fetch_history(base, TRIGGER_PERIOD, TRIGGER_INTERVAL)
 
     if df_trend_1h is None or df_trig is None:
-        return {}, False
+        return pd.DataFrame(), False
     if len(df_trend_1h) < 200 * 24 or len(df_trig) < 300:
-        return {}, False
+        return pd.DataFrame(), False
 
     df_4h = resample(df_trend_1h, "4h")
     df_1d = resample(df_trend_1h, "1D")
     if len(df_4h) < 60:
-        return {}, False
+        return pd.DataFrame(), False
+
+    destek_4h, direnc_4h = find_sr_zones(df_4h, SR_SWING_ORDER_4H)
+    destek_bolgeleri, direnc_bolgeleri = list(destek_4h), list(direnc_4h)
+    if len(df_1d) >= 2 * SR_SWING_ORDER_1D + 5:
+        destek_1d, direnc_1d = find_sr_zones(df_1d, SR_SWING_ORDER_1D)
+        destek_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in destek_1d]
+        direnc_bolgeleri += [(zp, t + SR_DAILY_TOUCH_BONUS) for zp, t in direnc_1d]
 
     trig = df_trig.sort_values("dt").reset_index(drop=True)
     qqe_bull, qqe_bear, qqe_strength, qqe_trend = compute_qqe(trig["Close"])
@@ -326,11 +313,13 @@ def backtest_symbol(base):
     atr_pct = atr_val / trig["Close"]
     atr_pct_avg = atr_pct.rolling(ATR_LOOKBACK).mean()
     atr_ok = atr_pct_avg.notna() & (atr_pct >= ATR_MIN_RATIO * atr_pct_avg)
+
+    # OBV (para akis yonu) ve anomali/haber-sicramasi filtresi - 15dk veriden
     obv_up_series = obv_rising_series(trig)
     bar_range = trig["High"] - trig["Low"]
     anomaly_series = bar_range.rolling(ANOMALY_LOOKBACK).max() > (ANOMALY_ATR_MULT * atr_val)
 
-    # ADX: 4S bar etiketi, bardaki SON saatlik mumun baslangicidir -> bar ancak etiket + 1 saat sonra tamamlanir
+    # ADX (trend gucu) - 4S veriden, her 15dk mumuna o ana kadar bilinen en son 4S degeri eslenir
     adx_4h, plus_di_4h, minus_di_4h = adx(df_4h)
     adx_df = pd.DataFrame({
         "dt": df_4h["dt"].reset_index(drop=True),
@@ -338,222 +327,179 @@ def backtest_symbol(base):
         "plus_di": plus_di_4h.reset_index(drop=True),
         "minus_di": minus_di_4h.reset_index(drop=True),
     })
-    saat = pd.Timedelta(hours=1)
-    adx_eski = pd.merge_asof(trig[["dt"]], adx_df, on="dt", direction="backward")
-    # Karar, 15dk mumun KAPANISINDA verilir (acilis + 15dk): o ana kadar tamamlanmis barlar bilinir
-    karar_zamani = trig[["dt"]].assign(dt=trig["dt"] + pd.Timedelta(minutes=15))
-    adx_yeni = pd.merge_asof(karar_zamani, adx_df.assign(dt=adx_df["dt"] + saat), on="dt", direction="backward")
-
-    # Noktasal-zaman (ileriye bakissiz) bolgeler icin tamamlanma zamanlari
-    avail4 = (df_4h["dt"] + saat).values.astype("datetime64[ns]")
-    avail1 = (df_1d["dt"] + saat).values.astype("datetime64[ns]")
-    T_degerler = (trig["dt"] + pd.Timedelta(minutes=15)).values.astype("datetime64[ns]")  # karar = mum kapanisi
-    onbellek = {}
-
-    def bolge_yeni(T):
-        n4 = int(np.searchsorted(avail4, T, side="right"))
-        n1 = int(np.searchsorted(avail1, T, side="right"))
-        anahtar = (n4, n1)
-        if anahtar not in onbellek:
-            if n4 < 60:
-                onbellek[anahtar] = ([], [])
-            else:
-                onbellek[anahtar] = bolgeleri_hesapla(df_4h.iloc[:n4], df_1d.iloc[:n1], True)
-        return onbellek[anahtar]
-
-    sabit_eski = bolgeleri_hesapla(df_4h, df_1d, False)
+    trig = pd.merge_asof(trig, adx_df, on="dt", direction="backward")
+    trend_guclu_series = trig["adx"].fillna(0) >= ADX_MIN
+    di_bull_series = trig["plus_di"].fillna(0) > trig["minus_di"].fillna(0)
+    di_bear_series = trig["minus_di"].fillna(0) > trig["plus_di"].fillna(0)
 
     closes = trig["Close"].values
     n = len(trig)
+    kayitlar = []
+    last_signal_idx = None
     COOLDOWN_CANDLES = 16  # 4 saat = 16 x 15dk
 
-    def tara(mod):
-        adx_m = adx_eski if mod == "ESKI" else adx_yeni
-        trend_guclu = (adx_m["adx"].fillna(0) >= ADX_MIN).values
-        di_bull = (adx_m["plus_di"].fillna(0) > adx_m["minus_di"].fillna(0)).values
-        di_bear = (adx_m["minus_di"].fillna(0) > adx_m["plus_di"].fillna(0)).values
-        kayitlar = []
-        last_signal_idx = None
-
-        for i in range(1, n):
-            if not bool(atr_ok.iloc[i]):
-                continue
-            if bool(anomaly_series.iloc[i]):
-                continue
-            strength_check = float(qqe_strength.iloc[i - 1])
-            bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
-                        and strength_check >= QQE_MIN_STRENGTH)
-            bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
-                        and strength_check >= QQE_MIN_STRENGTH)
-            bull_now = bull_now and bool(trend_guclu[i]) and bool(di_bull[i])
-            bear_now = bear_now and bool(trend_guclu[i]) and bool(di_bear[i])
-            if not (bull_now or bear_now):
-                continue
-            if last_signal_idx is not None and (i - last_signal_idx) < COOLDOWN_CANDLES:
-                continue
-            price_now = closes[i]
-
-            destek_bolgeleri, direnc_bolgeleri = sabit_eski if mod == "ESKI" else bolge_yeni(T_degerler[i])
-
-            long_zone = zone_below(price_now, destek_bolgeleri) if bull_now else None
-            short_zone = zone_above(price_now, direnc_bolgeleri) if bear_now else None
-            if long_zone is None and short_zone is None:
-                continue
-
-            strength_now = strength_check
-            spike_now = bool(volume_spike.iloc[i])
-            obv_now = bool(obv_up_series.iloc[i])
-
-            long_puan = short_puan = 0
-            if long_zone is not None:
-                _, touches, dist_pct = long_zone
-                long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                             + puan_momentum(strength_now) + puan_hacim(spike_now, obv_now))
-            if short_zone is not None:
-                _, touches, dist_pct = short_zone
-                short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
-                              + puan_momentum(strength_now) + puan_hacim(spike_now, not obv_now))
-
-            if long_zone is not None and long_puan >= short_puan:
-                direction, puan = "LONG", long_puan
-                tp_hedef = nearest_above_any(price_now, direnc_bolgeleri)
-            elif short_zone is not None:
-                direction, puan = "SHORT", short_puan
-                tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
-            else:
-                continue
-
-            if tp_hedef is None:
-                continue
-            if abs(tp_hedef[0] - price_now) / price_now < MIN_TP_DISTANCE_PCT:
-                continue
-            if puan < MIN_SINYAL_PUAN:
-                continue
-
-            start, end = i + 1, min(i + 1 + MFE_HORIZON, n)
-            if start >= end:
-                continue
-            window = closes[start:end]
-            if direction == "LONG":
-                pct_path = (window / price_now - 1) * 100
-            else:
-                pct_path = (price_now - window) / price_now * 100
-            mfe = float(np.max(pct_path))
-            mae = float(np.min(pct_path))
-
-            # SIRALI sonuc: once hedefe mi (+%5), once stop'a mi (-%3) degdi?
-            hit = pct_path >= SIRALI_HEDEF_PCT
-            stp = pct_path <= -SIRALI_STOP_PCT
-            t_hit = int(np.argmax(hit)) if hit.any() else None
-            t_stp = int(np.argmax(stp)) if stp.any() else None
-            if t_hit is not None and (t_stp is None or t_hit < t_stp):
-                sonuc, sirali_getiri = "kazanc", SIRALI_HEDEF_PCT
-            elif t_stp is not None:
-                sonuc, sirali_getiri = "kayip", -SIRALI_STOP_PCT
-            else:
-                sonuc, sirali_getiri = "belirsiz", float(pct_path[-1])
-
-            kayit = {
-                "mod": mod, "symbol": base, "dt": trig["dt"].iloc[i], "direction": direction,
-                "puan": puan, "guven": "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA",
-                "Close": price_now, "mfe_%": round(mfe, 2), "mae_%": round(mae, 2),
-                "sonuc": sonuc, "sirali_getiri_%": round(sirali_getiri, 2),
-            }
-            for h in HEDEF_YUZDELER:
-                kayit[f"hedef_%{h}_ulasti"] = mfe >= h
-            kayitlar.append(kayit)
-            last_signal_idx = i
-
-        return pd.DataFrame(kayitlar)
-
-    return {"ESKI": tara("ESKI"), "YENI": tara("YENI")}, True
-
-
-def rapor(df, baslik):
-    print("\n" + "#" * 64)
-    print(baslik)
-    print("#" * 64)
-    if df is None or df.empty:
-        print("Sinyal yok.")
-        return
-    n = len(df)
-    print(f"TOPLAM SINYAL: {n}   |   LONG: {(df['direction']=='LONG').sum()}  SHORT: {(df['direction']=='SHORT').sum()}")
-    print(f"Puan 9-10: {(df['puan']>=9).sum()}   Puan 8: {(df['puan']==8).sum()}")
-    print("\nSembol basina (ilk 10):")
-    print(df["symbol"].value_counts().head(10).to_string())
-
-    print(f"\nHEDEFE DEGME ORANI ({MFE_HORIZON//96} gun icinde HERHANGI BIR anda; stop dikkate alinmaz):")
-    for h in HEDEF_YUZDELER:
-        col = f"hedef_%{h}_ulasti"
-        print(f"  %{h}: %{df[col].mean()*100:.1f}  ({int(df[col].sum())}/{n})")
-    print(f"Ortalama MFE: %{df['mfe_%'].mean():.2f} | Medyan MFE: %{df['mfe_%'].median():.2f}")
-    print(f"Ortalama MAE: %{df['mae_%'].mean():.2f} | Medyan MAE: %{df['mae_%'].median():.2f}")
-
-    kz = (df["sonuc"] == "kazanc").mean() * 100
-    ky = (df["sonuc"] == "kayip").mean() * 100
-    bl = (df["sonuc"] == "belirsiz").mean() * 100
-    basabas = SIRALI_STOP_PCT / (SIRALI_HEDEF_PCT + SIRALI_STOP_PCT) * 100
-    print(f"\nSIRALI SONUC (hedef +%{SIRALI_HEDEF_PCT:g} / stop -%{SIRALI_STOP_PCT:g}, hangisine ONCE degdi):")
-    print(f"  Kazanc: %{kz:.1f} | Kayip: %{ky:.1f} | Belirsiz (3 gunde ikisine de degmedi): %{bl:.1f}")
-    print(f"  Basabas kazanc orani (belirsiz yokken): %{basabas:.1f}")
-    print(f"  Ortalama getiri / islem: %{df['sirali_getiri_%'].mean():.2f}  (ucret/kayma HARIC)")
-
-    print("\nPUAN BANDINA GORE:")
-    for ad, maske in (("Puan 9-10", df["puan"] >= 9), ("Puan 8", df["puan"] == 8)):
-        alt = df[maske]
-        if alt.empty:
-            print(f"  {ad}: sinyal yok")
+    for i in range(1, n):
+        if not bool(atr_ok.iloc[i]):
             continue
-        print(f"  {ad}: {len(alt)} sinyal | %5'e degen: %{alt['hedef_%5_ulasti'].mean()*100:.1f} | "
-              f"sirali kazanc: %{(alt['sonuc']=='kazanc').mean()*100:.1f} | ort. getiri: %{alt['sirali_getiri_%'].mean():.2f}")
+        if bool(anomaly_series.iloc[i]):
+            continue  # ani haber/manipulasyon sicramasi
+        # Momentum TEYIDI: donus bir onceki mumda olmus, hala gecerli olmali
+        strength_check = float(qqe_strength.iloc[i - 1])
+        bull_now = (bool(qqe_bull.iloc[i - 1]) and qqe_trend.iloc[i] == 1
+                    and strength_check >= QQE_MIN_STRENGTH)
+        bear_now = (bool(qqe_bear.iloc[i - 1]) and qqe_trend.iloc[i] == -1
+                    and strength_check >= QQE_MIN_STRENGTH)
+        # ADX kapisi: trend zayifsa (yatay piyasa) sinyal aranmaz
+        bull_now = bull_now and bool(trend_guclu_series.iloc[i]) and bool(di_bull_series.iloc[i])
+        bear_now = bear_now and bool(trend_guclu_series.iloc[i]) and bool(di_bear_series.iloc[i])
+        if not (bull_now or bear_now):
+            continue
+        if last_signal_idx is not None and (i - last_signal_idx) < COOLDOWN_CANDLES:
+            continue
+        price_now = closes[i]
+
+        long_zone = zone_below(price_now, destek_bolgeleri) if bull_now else None
+        short_zone = zone_above(price_now, direnc_bolgeleri) if bear_now else None
+        if long_zone is None and short_zone is None:
+            continue
+
+        strength_now = strength_check
+        spike_now = bool(volume_spike.iloc[i])
+        obv_now = bool(obv_up_series.iloc[i])
+
+        long_puan = short_puan = 0
+        if long_zone is not None:
+            _, touches, dist_pct = long_zone
+            long_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                         + puan_momentum(strength_now) + puan_hacim(spike_now, obv_now))
+        if short_zone is not None:
+            _, touches, dist_pct = short_zone
+            short_puan = (puan_bolge_guc(touches) + puan_yakinlik(dist_pct)
+                          + puan_momentum(strength_now) + puan_hacim(spike_now, not obv_now))
+
+        if long_zone is not None and long_puan >= short_puan:
+            direction, puan = "LONG", long_puan
+            tp_hedef = nearest_above_any(price_now, direnc_bolgeleri)
+        elif short_zone is not None:
+            direction, puan = "SHORT", short_puan
+            tp_hedef = nearest_below_any(price_now, destek_bolgeleri)
+        else:
+            continue
+
+        if tp_hedef is None:
+            continue
+        tp_dist_pct = abs(tp_hedef[0] - price_now) / price_now
+        if tp_dist_pct < MIN_TP_DISTANCE_PCT:
+            continue
+
+        if puan < MIN_SINYAL_PUAN:
+            continue
+
+        guven = "YUKSEK" if puan >= ESIK_YUKSEK_GUVEN else "ORTA"
+
+        start, end = i + 1, min(i + 1 + MFE_HORIZON, n)
+        if start >= end:
+            continue
+        window = closes[start:end]
+        if direction == "LONG":
+            pct_path = (window / price_now - 1) * 100
+        else:
+            pct_path = (price_now - window) / price_now * 100
+        mfe = float(np.max(pct_path))
+        mae = float(np.min(pct_path))
+
+        kayit = {
+            "symbol": base, "dt": trig["dt"].iloc[i], "direction": direction,
+            "puan": puan, "guven": guven, "Close": price_now,
+            "mfe_%": round(mfe, 2), "mae_%": round(mae, 2),
+        }
+        for h in HEDEF_YUZDELER:
+            kayit[f"hedef_%{h}_ulasti"] = mfe >= h
+        kayitlar.append(kayit)
+        last_signal_idx = i
+
+    if not kayitlar:
+        return pd.DataFrame(), True
+    return pd.DataFrame(kayitlar), True
 
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    tum = {"ESKI": [], "YENI": []}
-    basarili, alinamayan = [], []
+    all_signals = []
+    basarili_coinler, veri_alinamayan = [], []
 
     for idx, base in enumerate(CRYPTO_SYMBOLS):
-        print(f"[{idx+1}/{len(CRYPTO_SYMBOLS)}] Taraniyor: {base}...")
+        print(f"\n[{idx+1}/{len(CRYPTO_SYMBOLS)}] Taraniyor: {base}...")
         try:
-            sonuclar, veri_tamam = backtest_symbol(base)
+            res, veri_tamam = backtest_symbol(base)
         except Exception as e:
             print(f"HATA ({base}): {e}", file=sys.stderr)
-            alinamayan.append(base)
+            veri_alinamayan.append(base)
             continue
 
         if not veri_tamam:
-            print("  -> VERI ALINAMADI")
-            alinamayan.append(base)
+            print(f"  -> VERI ALINAMADI")
+            veri_alinamayan.append(base)
         else:
-            basarili.append(base)
-            for mod in ("ESKI", "YENI"):
-                if not sonuclar[mod].empty:
-                    tum[mod].append(sonuclar[mod])
-            print(f"  -> eski yontem: {len(sonuclar['ESKI'])} | yeni yontem: {len(sonuclar['YENI'])} sinyal")
+            basarili_coinler.append(base)
+            if res is not None and not res.empty:
+                all_signals.append(res)
+                print(f"  -> {len(res)} sinyal bulundu")
+            else:
+                print(f"  -> veri tamam, ama hic sinyal olusmamis")
 
         if idx < len(CRYPTO_SYMBOLS) - 1:
             time.sleep(3)
 
-    print("\n" + "=" * 64)
-    print(f"VERI DURUMU: {len(basarili)}/{len(CRYPTO_SYMBOLS)} coin basariyla tarandi")
-    if alinamayan:
-        print(f"Veri alinamayan coinler: {', '.join(alinamayan)}")
+    print("\n" + "=" * 60)
+    print(f"VERI DURUMU: {len(basarili_coinler)}/{len(CRYPTO_SYMBOLS)} coin basariyla tarandi")
+    if veri_alinamayan:
+        print(f"Veri alinamayan coinler: {', '.join(veri_alinamayan)}")
+    print("=" * 60)
 
-    df_eski = pd.concat(tum["ESKI"], ignore_index=True) if tum["ESKI"] else pd.DataFrame()
-    df_yeni = pd.concat(tum["YENI"], ignore_index=True) if tum["YENI"] else pd.DataFrame()
+    if not all_signals:
+        print("\nHICBIR SINYAL BULUNAMADI.")
+        return
 
-    rapor(df_eski, "ESKI YONTEM (tum gecmisten bolge + zincirleme kumeleme = ileriye bakis VAR)")
-    rapor(df_yeni, "YENI YONTEM (sadece o ana kadar tamamlanmis mumlar + sabit capali kumeleme = CANLI BOT BU)")
+    df = pd.concat(all_signals, ignore_index=True)
+    df = df.sort_values("dt")
+    out_path = os.path.join(OUT_DIR, "backtest_sonuclari.csv")
+    df.to_csv(out_path, index=False)
 
-    birlesik = pd.concat([d for d in (df_eski, df_yeni) if not d.empty], ignore_index=True) \
-        if (not df_eski.empty or not df_yeni.empty) else pd.DataFrame()
-    if not birlesik.empty:
-        out_path = os.path.join(OUT_DIR, "backtest_sonuclari.csv")
-        birlesik.sort_values(["mod", "dt"]).to_csv(out_path, index=False)
-        print(f"\nTum detaylar kaydedildi: {out_path}")
+    print("\n" + "=" * 60)
+    print(f"TOPLAM SINYAL SAYISI: {len(df)}")
+    print(f"LONG: {(df['direction']=='LONG').sum()}  |  SHORT: {(df['direction']=='SHORT').sum()}")
+    print(f"YUKSEK GUVEN: {(df['guven']=='YUKSEK').sum()}  |  ORTA GUVEN: {(df['guven']=='ORTA').sum()}")
+    print("=" * 60)
 
-    print("\nNOT: Gercek performansi YENI YONTEM yansitir. ESKI ile arasindaki fark, ileriye bakisin ne kadar iyimserlik kattigini gosterir.")
+    print("\nSembol basina sinyal sayisi:")
+    print(df["symbol"].value_counts().to_string())
+
+    print("\n" + "-" * 60)
+    print(f"HEDEF YAKALAMA ORANI (sinyalden sonraki {MFE_HORIZON//96} gun icinde):")
+    print("-" * 60)
+    for h in HEDEF_YUZDELER:
+        col = f"hedef_%{h}_ulasti"
+        oran = df[col].mean() * 100
+        print(f"  %{h}'e ulasan sinyal orani: %{oran:.1f}  ({df[col].sum()}/{len(df)} sinyal)")
+
+    print(f"\nOrtalama MFE: %{df['mfe_%'].mean():.2f}  |  Medyan MFE: %{df['mfe_%'].median():.2f}")
+    print(f"Ortalama MAE: %{df['mae_%'].mean():.2f}  |  Medyan MAE: %{df['mae_%'].median():.2f}")
+
+    print("\n" + "-" * 60)
+    print("GUVEN SEVIYESINE GORE HEDEF YAKALAMA:")
+    print("-" * 60)
+    for guven_lvl in ["YUKSEK", "ORTA"]:
+        alt = df[df["guven"] == guven_lvl]
+        if alt.empty:
+            print(f"{guven_lvl}: sinyal yok")
+            continue
+        print(f"{guven_lvl}: {len(alt)} sinyal")
+        for h in [5, 10]:
+            col = f"hedef_%{h}_ulasti"
+            print(f"    -> %{h} hedefe ulasan oran: %{alt[col].mean()*100:.1f}")
+
+    print(f"\nTum detaylar kaydedildi: {out_path}")
 
 
 if __name__ == "__main__":
