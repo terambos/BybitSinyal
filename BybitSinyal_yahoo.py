@@ -478,7 +478,7 @@ def format_signal_email(sig):
     # candle_ts mumun BASLANGICIDIR; kapanis = baslangic + 15 dk
     dt_tr = datetime.fromtimestamp(sig["candle_ts"] / 1000, tz=TR_TZ) + timedelta(minutes=15)
     guven_tr = "YUKSEK GUVEN" if sig["guven"] == "YUKSEK" else "ORTA GUVEN"
-    subject = f"[SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
+    subject = f"[Yahoo-Bybit][SINYAL-{sig['guven']}] {sig['symbol']} {sig['direction']} ({sig['puan']}/{MAX_PUAN})"
 
     tp_satir = f"Olasi TP (en yakin ters bolge): {sig['tp_hedef']}\n" if sig["tp_hedef"] else ""
 
@@ -507,7 +507,7 @@ def main():
         print("TEST MODU: deneme maili gonderiliyor...")
         try:
             send_email(
-                "[TEST] Sinyal Botu Mail Kontrolu",
+                "[Yahoo-Bybit][TEST] Sinyal Botu Mail Kontrolu",
                 "Bu bir test mailidir. Bu maili aldiysan, mail gonderim sistemi "
                 "calisiyor demektir. Gercek sinyaller ayni formatta gelecek.\n"
             )
